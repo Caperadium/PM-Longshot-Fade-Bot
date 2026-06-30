@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -29,7 +30,7 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA busy_timeout=8000;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -257,3 +258,31 @@ def execute_many(query: str, params_list: list) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def execute_write(query: str, params: tuple = (), retries: int = 3, base_sleep: float = 0.2) -> int:
+    """Single-statement write with retry ONLY on lock/busy. Returns rowcount.
+
+    Engine + dashboard both write WAL concurrently; a write that's still
+    waiting past busy_timeout raises sqlite3.OperationalError("database is
+    locked"). Retries with backoff only for locked/busy — any other
+    OperationalError (corruption, constraint, etc.) propagates immediately,
+    as does any non-OperationalError exception.
+    """
+    last: Optional[Exception] = None
+    for attempt in range(retries):
+        conn = get_connection()
+        try:
+            cur = conn.execute(query, params)
+            conn.commit()
+            return cur.rowcount
+        except sqlite3.OperationalError as e:
+            last = e
+            msg = str(e).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise  # corruption/constraint/etc -> fail loud, do NOT retry
+            time.sleep(base_sleep * (2 ** attempt))
+        finally:
+            conn.close()
+    logger.warning(f"execute_write exhausted retries: {last}")
+    return 0

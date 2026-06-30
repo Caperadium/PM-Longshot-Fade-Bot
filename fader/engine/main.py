@@ -23,6 +23,7 @@ import os
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -79,6 +80,15 @@ async def run() -> None:
     # ------------------------------------------------------------------
     # 2. Core objects
     # ------------------------------------------------------------------
+    loop = asyncio.get_running_loop()
+
+    # L2: sized ThreadPoolExecutor for blocking REST calls — set as the
+    # default loop executor (so bare run_in_executor(None, ...) calls in
+    # strategy_loop/ws_client/etc. also use it) and passed explicitly to
+    # Provider.
+    executor = ThreadPoolExecutor(max_workers=cfg.feed.executor_workers)
+    loop.set_default_executor(executor)
+
     rl = RateLimiter(
         write_per_s=cfg.ratelimit.write_per_s,
         write_burst=cfg.ratelimit.write_burst,
@@ -95,7 +105,10 @@ async def run() -> None:
         max_deployed_pct=cfg.risk.max_deployed_pct,
         per_market_cap_pct=cfg.risk.per_market_cap_pct,
     )
-    provider = Provider(limiter=rl, mode=cfg.mode, paper_bankroll_usdc=cfg.bankroll.paper_bankroll_usdc)
+    provider = Provider(
+        limiter=rl, mode=cfg.mode, executor=executor,
+        paper_bankroll_usdc=cfg.bankroll.paper_bankroll_usdc,
+    )
     reconciler = Reconciler(provider=provider, risk=risk, order_manager=None)  # set below
 
     # ------------------------------------------------------------------
@@ -103,7 +116,6 @@ async def run() -> None:
     # ------------------------------------------------------------------
     token_map: Dict[str, Any] = {}
     series_slugs: List[str] = []     # series children tracked separately
-    loop = asyncio.get_event_loop()
     today = datetime.now(timezone.utc).date()
 
     for slug_row in cfg.enabled_slugs():
@@ -209,11 +221,12 @@ async def run() -> None:
                     f"Market resolved via WS: {slug} ({resolved_token[:16]}...)"
                 )
                 from infra import telegram
-                asyncio.create_task(
-                    telegram.send(f"Market resolved: <b>{slug}</b>")
-                )
+                telegram.fire(telegram.send(f"Market resolved: <b>{slug}</b>"))
                 break
 
+    # FIX 2: clamp resync concurrency to the read-rate burst so reconnect
+    # resync can't trigger a 429 storm.
+    resync_concurrency = min(cfg.feed.resync_concurrency, cfg.ratelimit.read_burst)
     ws = WsClient(
         book_store=book_store,
         staleness=staleness,
@@ -222,6 +235,13 @@ async def run() -> None:
         market_resolved_cb=on_market_resolved,
         band_low=cfg.strategy.band_low,
         band_high=cfg.strategy.band_high,
+        resync_concurrency=resync_concurrency,
+    )
+    ws.set_watchdog(
+        cfg.feed.ws_force_reconnect_s,
+        cfg.feed.ws_ping_interval_s,
+        cfg.feed.ws_pong_timeout_s,
+        cfg.feed.ws_expect_pong,
     )
     await ws.start(token_ids)
 
@@ -237,6 +257,17 @@ async def run() -> None:
     # ------------------------------------------------------------------
     order_manager = OrderManager(cfg=cfg, provider=provider, risk=risk)
     reconciler._order_manager = order_manager  # wire after creation
+
+    # FIX 3: rehydrate any resting LIMIT orders that survived a restart,
+    # before any background task (requote_loop) starts reading _resting.
+    if cfg.mode != "paper":
+        try:
+            n_rehydrated = await order_manager.rehydrate_resting()
+            if n_rehydrated:
+                logger.info(f"Startup rehydrate: {n_rehydrated} resting order(s) recovered")
+        except Exception as e:
+            logger.error(f"Startup rehydrate_resting failed: {e}")
+
     strategy_loop = StrategyLoop(
         cfg=cfg,
         book_store=book_store,
@@ -329,6 +360,12 @@ async def run() -> None:
                 cfg.feed.gap_halt_seconds,
             )
             ws.set_band(cfg.strategy.band_low, cfg.strategy.band_high)
+            ws.set_watchdog(
+                cfg.feed.ws_force_reconnect_s,
+                cfg.feed.ws_ping_interval_s,
+                cfg.feed.ws_pong_timeout_s,
+                cfg.feed.ws_expect_pong,
+            )
 
     control = ControlConsumer(
         poll_s=cfg.polling.control_poll_s,
@@ -353,6 +390,12 @@ async def run() -> None:
                         cfg.feed.gap_halt_seconds,
                     )
                     ws.set_band(cfg.strategy.band_low, cfg.strategy.band_high)
+                    ws.set_watchdog(
+                        cfg.feed.ws_force_reconnect_s,
+                        cfg.feed.ws_ping_interval_s,
+                        cfg.feed.ws_pong_timeout_s,
+                        cfg.feed.ws_expect_pong,
+                    )
                     strategy_loop.set_bankroll(reconciler.bankroll)
             except Exception as e:
                 logger.error(f"Config watch error: {e}")
@@ -391,7 +434,7 @@ async def run() -> None:
         def _handle_signal(*_):
             stop_event.set()
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, _handle_signal)
@@ -404,12 +447,25 @@ async def run() -> None:
 
     logger.info("Engine shutting down")
     await strategy_loop.stop()
+
+    # FIX 5: cancel resting limit orders before the process exits so they
+    # don't orphan on the exchange. Timeout path leaves them PENDING in
+    # DB; rehydrate_resting recovers them on next boot.
+    if cfg.mode != "paper":
+        try:
+            await asyncio.wait_for(order_manager.cancel_all_resting("shutdown"), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("cancel_all_resting timed out; orphans handled by rehydrate on next boot")
+        except Exception as e:
+            logger.warning(f"cancel_all_resting error: {e}")
+
     await ws.stop()
     pollers.stop()
     state_pub.stop()
     control.stop()
     heartbeat.stop()
     await telegram.alert_stop("graceful shutdown")
+    executor.shutdown(wait=False)
 
 
 def main() -> None:

@@ -335,7 +335,7 @@ class StrategyLoop:
             if dte is not None:
                 return dte
         # Fallback: Gamma API
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(None, lambda: compute_dte(slug))
         except Exception:
@@ -346,7 +346,7 @@ class StrategyLoop:
         cached_ts = self._volume_cache_ts.get(slug, 0.0)
         if now - cached_ts < self._volume_ttl_s and slug in self._volume_cache:
             return self._volume_cache[slug]
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             vols = await loop.run_in_executor(None, lambda: fetch_volumes(slug))
         except Exception:

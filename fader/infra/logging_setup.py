@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 
@@ -45,6 +46,8 @@ def setup_logging(
     level: str = "INFO",
     log_file: Optional[str] = None,
     json_console: bool = False,
+    max_bytes: int = 10_000_000,
+    backup_count: int = 5,
 ) -> None:
     root = logging.getLogger()
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -61,9 +64,11 @@ def setup_logging(
         ))
     root.addHandler(ch)
 
-    # Optional file handler (JSON)
+    # Optional file handler (JSON), rotated to bound disk footprint
     if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh = RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(JsonFormatter())
         root.addHandler(fh)

@@ -17,24 +17,10 @@ logger = logging.getLogger(__name__)
 
 def _safe_fire_alert(coro) -> None:
     """Schedule an async coroutine from a potentially sync context.
-    Uses asyncio.create_task if an event loop is running; otherwise
-    starts a background thread (safe for tests and sync callers)."""
-    try:
-        import asyncio
-        asyncio.create_task(coro)
-    except RuntimeError:
-        # No running event loop — use a thread fallback
-        import asyncio as _asyncio
-        import threading
-
-        def _run():
-            try:
-                _asyncio.run(coro)
-            except Exception:
-                pass
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
+    Delegates to infra.telegram.fire(), which retains a task ref (GC-safe)
+    and falls back to a background thread when no event loop is running."""
+    from infra import telegram
+    telegram.fire(coro)
 
 
 class RiskManager:
