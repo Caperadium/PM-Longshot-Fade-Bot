@@ -11,7 +11,7 @@ strategy:
 
 filters:
   min_24h_volume: 1000.0
-  min_total_volume: 10000.0
+  min_total_volume: 1000.0
   min_book_depth: 0.0  # USD notional at NO touch; 0 = filter off
 
 feed:

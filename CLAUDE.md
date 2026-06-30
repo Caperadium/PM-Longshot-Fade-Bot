@@ -24,6 +24,12 @@ python -c "import sys; sys.path.insert(0,'fader'); from backtest.allocation_anal
 # Band sweep CLI
 python -c "import sys; sys.path.insert(0,'fader'); from backtest.band_sweep import main; main()"
 
+# Grid sweep backtest (parameter search)
+python -c "import sys; sys.path.insert(0,'fader'); from backtest.grid_sweep import main; main()"
+
+# IS/OOS backtest (in-sample / out-of-sample validation)
+python -c "import sys; sys.path.insert(0,'fader'); from backtest.is_oos_backtest import main; main()"
+
 # Tests
 python -m pytest fader/tests/test_live_readiness.py -v
 python -m pytest fader/tests/test_allocation_analysis.py -v
@@ -42,7 +48,7 @@ Requires `.env` with `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_USER_ADDRESS`, and op
 1. Load config (config.yaml + slugs.csv)
 2. Init DB tables
 3. Resolve NO token IDs via Gamma API
-4. Startup safety checks (MATIC balance, USDC allowance)
+4. Startup safety checks (USDC allowance; MATIC gate removed — CLOB orders are off-chain signed messages, no gas needed)
 5. Full API reconciliation (bankroll, orders, positions)
 6. Open CLOB websocket with exponential backoff
 7. Wait for initial order books (REST resync on connect)
@@ -94,6 +100,7 @@ Current series:
 | Slug | Filter | From | Markets |
 |---|---|---|---|
 | `bitcoin-above-on` | `bitcoin-above` | 2024-01-01 | ~3,200 BTC daily price-threshold binaries |
+| `ethereum-above-on` | `ethereum-above` | 2025-01-01 | ~1,800 ETH daily price-threshold binaries |
 | `highest-temperature-in-seoul-on` | `highest-temperature-in-seoul` | 2025-12-01 | ~200 Seoul daily temp ladder rungs |
 
 **Adding a new series:**
@@ -111,15 +118,25 @@ Current series:
 
 | Module | Role |
 |---|---|
+| `config/config_loader.py` | AppConfig, load_config, config hot-reload (5s mtime poll) |
 | `execution/provider.py` | Polymarket REST wrapper (paper + live), MarketInfo, CLOB client |
-| `marketdata/ws_client.py` | Persistent CLOB websocket, reconnect, delta/snapshot handling |
+| `execution/order_manager.py` | Order placement, market/limit dispatch, requote loop, TTL |
+| `execution/sizing.py` | Alpha tilt notional sizing, band redistribution, $1.00 floor |
+| `execution/idempotency.py` | Deterministic idempotency keys for all orders |
+| `marketdata/ws_client.py` | Persistent CLOB websocket, reconnect, delta/snapshot handling, REST resync |
 | `marketdata/book_state.py` | In-memory OrderBook per contract, band-entry timing tracker |
 | `marketdata/staleness.py` | Per-contract staleness + feed-wide gap-halt |
-| `engine/risk.py` | Circuit breaker, max deployed, per-market caps, MATIC gate |
+| `marketdata/rest_market.py` | REST endpoints: DTE, volumes, series market discovery |
+| `engine/risk.py` | Circuit breaker, max deployed, per-market caps |
 | `engine/reconciler.py` | Startup + periodic API reconciliation (bankroll, orders, positions) |
 | `engine/control_consumer.py` | Dashboard-to-engine IPC via control_commands table |
-| `infra/db.py` | SQLite WAL schema, all 8 tables + indexes |
+| `engine/pollers.py` | Bankroll (30s), resolution (60s), discovery (300s) background tasks |
+| `engine/state_publisher.py` | Engine → DB state publishing (2s interval) |
+| `infra/db.py` | SQLite WAL schema, all 10 tables + 11 indexes |
 | `infra/telegram.py` | Telegram alerts (heartbeat, breaker trips, errors) |
+| `infra/rate_limiter.py` | Token-bucket rate limiter for API calls |
+| `infra/logging_setup.py` | Structured logging configuration |
+| `persistence/decision_log.py` | Per-decision log persistence to decisions table |
 | `dashboard/app.py` | 8-tab Streamlit dashboard |
 | `dashboard/backtest_page.py` | Backtest UI (embedded + standalone) with parameter sweep |
 | `backtest/engine.py` | Backtest engine with filter reapplication |
@@ -128,6 +145,8 @@ Current series:
 | `backtest/walkforward.py` | Walk-forward stability (calendar window partitioning) |
 | `backtest/band_sweep.py` | Sweep lower band bound across allocation tilts |
 | `backtest/allocation_analysis.py` | Full α-sweep: monotonicity, concavity, paired CIs |
+| `backtest/grid_sweep.py` | Grid sweep backtest for parameter search |
+| `backtest/is_oos_backtest.py` | IS/OOS (in-sample / out-of-sample) backtest validation |
 
 ## Config
 

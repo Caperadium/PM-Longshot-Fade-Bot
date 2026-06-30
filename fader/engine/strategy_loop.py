@@ -183,7 +183,7 @@ class StrategyLoop:
                 band_low=band_low, band_high=band_high,
                 notional=notional, market_info=mi,
                 total_deployed=total_deployed, by_slug=by_slug,
-                ask_f=ask_f, log_decisions=False,
+                ask_f=ask_f, log_decisions=True,
             )
             total_deployed += delta
 
@@ -218,8 +218,11 @@ class StrategyLoop:
         filters: Dict[str, Any] = {}
 
         # -- Filter 3: continuously in band --
+        # Paper mode: skip the min-time-in-band gate. Longshot-tail markets
+        # trade thinly, so they rarely accrue enough continuous in-band WS
+        # time; the gate would starve paper runs of entries.
         time_in_band = book.time_in_band()
-        if not book.is_in_band_long_enough(cfg.strategy.min_time_in_band_s):
+        if cfg.mode != "paper" and not book.is_in_band_long_enough(cfg.strategy.min_time_in_band_s):
             if log_decisions:
                 filters["time_in_band_s"] = time_in_band
                 filters["min_time_in_band_s"] = cfg.strategy.min_time_in_band_s
