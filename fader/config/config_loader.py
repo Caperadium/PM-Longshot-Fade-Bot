@@ -276,6 +276,7 @@ class ConfigWatcher:
         try:
             new = load_config(self._cp, self._sp)
             self._apply_hot(new)
+            apply_config_kv_overrides(self._cfg)  # KV overlay always wins over yaml
             self._last_mtime_cfg = cfg_mtime
             self._last_mtime_slugs = slugs_mtime
             logger.info("Config hot-reloaded")

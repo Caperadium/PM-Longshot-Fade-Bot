@@ -519,6 +519,16 @@ class TestConfigIntegrity(unittest.TestCase):
         self.assertIn("c.risk.matic_min_balance", src,
                       "ConfigWatcher._apply_hot must copy matic_min_balance")
 
+    def test_check_and_reload_reapplies_kv_overrides(self):
+        src = (_FADER_ROOT / "config" / "config_loader.py").read_text()
+        # check_and_reload must re-overlay config_kv after _apply_hot so file
+        # edits never silently revert dashboard overrides
+        idx_reload = src.index("def check_and_reload")
+        idx_next = src.index("def _apply_hot")
+        body = src[idx_reload:idx_next]
+        self.assertIn("apply_config_kv_overrides", body,
+                      "check_and_reload must re-apply config_kv overrides after _apply_hot")
+
     def test_load_config_populates_matic(self):
         from config.config_loader import load_config
         cfg = load_config()
