@@ -1,0 +1,57 @@
+mode: paper  # paper | live
+
+strategy:
+  band_low: 0.80
+  band_high: 0.95
+  min_dte: 0
+  max_dte: 365
+  min_time_in_band_s: 600
+  order_notional_usd: 10.0
+  alpha: 0.0  # tilt ∈ [-1, +1]; 0=uniform, -1=low-price, +1=high-price
+
+filters:
+  min_24h_volume: 1000.0
+  min_total_volume: 10000.0
+  min_book_depth: 0.0  # USD notional at NO touch; 0 = filter off
+
+feed:
+  decision_interval_s: 1.0
+  max_staleness_seconds: 30
+  gap_halt_seconds: 60
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+polling:
+  bankroll_s: 30
+  resolution_s: 60
+  discovery_s: 300
+  control_poll_s: 1.0
+
+orders:
+  spread_market_threshold_c: 1.0  # cents; <= this = market order
+  requote_move_c: 0.5             # cents mid-move to trigger cancel-replace
+  limit_ttl_s: 300                # 5 min TTL before re-evaluate
+
+risk:
+  daily_loss_breaker_pct: 5.0
+  max_deployed_pct: 100.0
+  per_market_cap_pct: 5.0
+  matic_min_balance: 0.0  # MATIC; not required for off-chain CLOB orders
+
+telegram:
+  heartbeat_minutes: 15
+  enabled: true
+
+# Conservative token-bucket rates; orders of magnitude below documented CLOB limits.
+# Documented ceilings: writes 5000/10s, /book & /price 1500/10s, general 9000/10s.
+ratelimit:
+  write_per_s: 10.0
+  write_burst: 20
+  read_per_s: 5.0
+  read_burst: 10
+
+auth:
+  mode: eoa  # EOA private key; signature_type 0
+
+bankroll:
+  basis: cash  # all risk gating keys off on-chain USDC.e cash only
+  paper_bankroll_usdc: 1000.0  # simulated USDC balance in paper mode

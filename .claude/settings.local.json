@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.polymarket.com)",
+      "Bash(python -c ' *)",
+      "WebFetch(domain:gamma-api.polymarket.com)"
+    ]
+  }
+}
