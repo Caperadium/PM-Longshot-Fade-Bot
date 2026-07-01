@@ -33,7 +33,7 @@ class ControlConsumer:
         self._poll_s = poll_s
         self._cbs: Dict[str, Optional[Callable]] = {
             "stop": stop_engine_cb,
-            "start": None,  # no-op; engine already running
+            "start": stop_engine_cb,  # same dispatcher; restarts strategy loop
             "close_all": close_all_cb,
             "breaker_reset": breaker_reset_cb,
             "config_reload": config_reload_cb,

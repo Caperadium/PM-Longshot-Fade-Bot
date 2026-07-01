@@ -372,6 +372,13 @@ class Provider:
             resp = client.create_and_post_order(args)
             order_id = None
             if isinstance(resp, dict):
+                # A 200 response can still carry success=false + errorMsg
+                # (e.g. FOK killed). Treat it as a rejection, not a fill.
+                if resp.get("success") is False:
+                    err = resp.get("errorMsg") or "order rejected (success=false)"
+                    logger.error(f"place_order rejected: {err}")
+                    return {"success": False, "order_id": None, "error": err,
+                            "simulated": False}
                 order_id = resp.get("orderID") or resp.get("order_id")
             elif hasattr(resp, "orderID"):
                 order_id = resp.orderID

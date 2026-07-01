@@ -277,6 +277,9 @@ async def run() -> None:
     strategy_loop.set_token_map(token_map)
     strategy_loop.set_order_manager(order_manager)
     strategy_loop.set_bankroll(reconciler.bankroll)
+    # Live source: risk caps + breaker track the 30s bankroll poller,
+    # not the value captured at startup.
+    strategy_loop.set_bankroll_source(lambda: reconciler.bankroll)
     strategy_loop.set_series_slugs(series_slugs)
 
     # Pre-warm volume cache for series slugs (avoids 500+ cold Gamma calls on first tick)
@@ -342,6 +345,9 @@ async def run() -> None:
         if cmd == "stop":
             logger.info("Stop command received")
             await strategy_loop.stop()
+        elif cmd == "start":
+            logger.info("Start command received")
+            await strategy_loop.start()
         elif cmd == "close_all":
             logger.info("Close-all command received")
             await order_manager.close_all()

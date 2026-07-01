@@ -64,11 +64,13 @@ class Reconciler:
                 logger.error(f"Paper startup cleanup error: {e}")
             finally:
                 conn.close()
+        # Positions before orders: order reconcile decides FILLED-vs-UNKNOWN
+        # by looking for an open position on the order's token.
         await asyncio.gather(
             self._reconcile_bankroll(),
-            self._reconcile_orders(),
             self._reconcile_positions(),
         )
+        await self._reconcile_orders()
 
     # ------------------------------------------------------------------
     # Bankroll
@@ -126,7 +128,18 @@ class Reconciler:
             if oid.startswith("SIM-") or oid.startswith("FAKE-"):
                 continue  # paper mode simulated
             if oid not in live_ids:
-                # Not live — don't guess FILLED. Mark UNKNOWN.
+                # An open position on this token means the order filled
+                # (positions reconcile runs before this). Otherwise: not
+                # live and no position — don't guess FILLED, mark UNKNOWN.
+                if _has_open_position(token_id):
+                    if self._order_manager:
+                        self._order_manager.mark_filled(oid, token_id)
+                    else:
+                        _update_order_status(oid, "FILLED")
+                    logger.info(
+                        f"Order {oid[:16]} no longer live + position open — FILLED"
+                    )
+                    continue
                 _update_order_status(oid, "UNKNOWN")
                 # Also pop from OrderManager._resting so re-entry isn't blocked
                 if self._order_manager:
@@ -231,6 +244,19 @@ def _import_position(conn, pos: Dict, pos_id: str, user: str) -> None:
             now,
         ),
     )
+
+
+def _has_open_position(token_id: str) -> bool:
+    from infra.db import get_connection
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM positions WHERE token_id=? AND status='OPEN' LIMIT 1",
+            (token_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 
 def _update_order_status(order_id: str, status: str) -> None:

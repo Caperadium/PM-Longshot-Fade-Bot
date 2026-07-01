@@ -15,7 +15,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config.config_loader import AppConfig
 from execution.idempotency import make_key, is_already_submitted
@@ -374,19 +374,52 @@ class OrderManager:
             await self._cancel_resting(token_id, "ttl_or_band_exit")
 
     async def _requote(self, order: RestingOrder, book) -> None:
-        await self._cancel_resting(order.token_id, "requote")
+        if not await self._cancel_resting(order.token_id, "requote"):
+            # Cancel failed — old order may still be live. Placing a
+            # replacement would risk two live orders (double exposure).
+            return
         mid = float(book.mid) if book.mid else float(book.best_ask)
         notional = self._cfg.size_for_slug(order.slug)
         filters: Dict = {"requote": True}
         await self._place_limit(order.slug, order.token_id, mid, float(book.best_ask), notional, filters)
 
-    async def _cancel_resting(self, token_id: str, reason: str) -> None:
+    async def _cancel_resting(self, token_id: str, reason: str) -> bool:
+        """Cancel a resting order. Returns True when the cancel was accepted.
+
+        On cancel failure the order is re-tracked in _resting so TTL/requote
+        keeps managing it and the next pass retries the cancel; if the order
+        is actually gone on the exchange the reconciler's mark_vanished pops
+        it within one resolution cycle.
+        """
         order = self._resting.pop(token_id, None)
         if order is None:
-            return
+            return True
         result = await self._provider.async_cancel_order(order.order_id)
+        if not result.get("success"):
+            self._resting[token_id] = order
+            self._update_order_status(
+                order.order_id, "UNKNOWN", f"cancel_failed:{reason}"
+            )
+            logger.warning(
+                f"Cancel FAILED for {order.order_id} ({reason}): "
+                f"{result.get('error')} — order re-tracked, will retry"
+            )
+            return False
         self._update_order_status(order.order_id, "CANCELLED", reason)
         logger.info(f"Cancelled {order.order_id} ({reason})")
+        return True
+
+    def resting_exposure(self) -> Tuple[float, Dict[str, float]]:
+        """(total_notional, {slug: notional}) of in-flight resting limit
+        orders. Counted against the deployed caps so unfilled limits can't
+        over-commit the bankroll (they don't create position rows until
+        they fill)."""
+        total = 0.0
+        by_slug: Dict[str, float] = {}
+        for o in list(self._resting.values()):
+            total += o.notional
+            by_slug[o.slug] = by_slug.get(o.slug, 0.0) + o.notional
+        return total, by_slug
 
     def mark_filled(self, order_id: str, token_id: str) -> None:
         """Called by reconciler when an order becomes filled."""
@@ -472,8 +505,21 @@ class OrderManager:
             telegram.fire(telegram.send(f"<b>{msg}</b>"))
             return
 
+        failures = 0
         for row in rows:
-            await self._provider.async_market_sell(row["token_id"], row["size"])
+            result = await self._provider.async_market_sell(row["token_id"], row["size"])
+            if not result.get("success"):
+                failures += 1
+                logger.error(
+                    f"close_all sell failed for {row['token_id'][:16]}: "
+                    f"{result.get('error')}"
+                )
+        if failures:
+            from infra import telegram
+            telegram.fire(telegram.send(
+                f"<b>close_all: {failures}/{len(rows)} sells FAILED</b> — "
+                f"positions remain open, check dashboard"
+            ))
 
     # ------------------------------------------------------------------
     # DB helpers
