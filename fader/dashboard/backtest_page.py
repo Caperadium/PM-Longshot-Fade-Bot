@@ -61,10 +61,14 @@ def _expand_series_slugs(
             else:
                 # Fallback: strip trailing '-on'
                 series_filter = s[:-3] if s.endswith("-on") else s
-            # Find all stored slugs matching this series
+            # Find all stored slugs matching this series. Match by
+            # substring, not prefix — Polymarket ships some children with
+            # a leading "will-the-" (e.g. will-the-highest-temperature-in-
+            # seoul-be-3c-on-...) so the filter keyword is not always the
+            # slug prefix.
             series_markets = [
                 x for x in stored
-                if x.startswith(series_filter + "-")
+                if series_filter in x
             ]
             if series_markets:
                 expanded.extend(series_markets)
@@ -95,21 +99,24 @@ def render(embedded: bool = True) -> None:
     stored_slugs = store.all_slugs()
     config_slugs = [s.slug for s in cfg.enabled_slugs()]
 
-    # Build set of series-child prefixes so individual market slugs
+    # Build set of series filter keywords so individual market slugs
     # (e.g. bitcoin-above-100k-on-january-1) are excluded from the
-    # dropdown — only the virtual series slug is shown.
-    series_prefixes: set[str] = set()
+    # dropdown — only the virtual series slug is shown. Match by
+    # substring, not prefix: some children carry a leading "will-the-"
+    # (e.g. will-the-highest-temperature-in-seoul-be-3c-on-...) so the
+    # filter keyword is not always the slug prefix.
+    series_filters: set[str] = set()
     for s in cfg.slugs:
         kind = s.market_kind
         if kind in ("series", "btc_daily"):
             sf = (s.series_filter if s.series_filter
                   else (s.slug[:-3] if s.slug.endswith("-on") else s.slug))
-            series_prefixes.add(sf + "-")
+            series_filters.add(sf)
 
     # Only show config slugs + non-series stored slugs (no child markets)
     non_series_stored = [
         s for s in stored_slugs
-        if not any(s.startswith(prefix) for prefix in series_prefixes)
+        if not any(sf in s for sf in series_filters)
     ]
     available_slugs = non_series_stored + [
         s for s in config_slugs if s not in non_series_stored
