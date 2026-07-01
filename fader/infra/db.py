@@ -18,7 +18,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent.parent / "fader.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "fader.db"
 
 
 def set_db_path(path: Path) -> None:

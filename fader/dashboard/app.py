@@ -24,8 +24,9 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-# Make fader modules importable
-_FADER_ROOT = Path(__file__).parent.parent
+# Make fader modules importable (resolve() so a relative __file__ under
+# `streamlit run` from any cwd still yields the absolute fader/ root).
+_FADER_ROOT = Path(__file__).resolve().parent.parent
 if str(_FADER_ROOT) not in sys.path:
     sys.path.insert(0, str(_FADER_ROOT))
 

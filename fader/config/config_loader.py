@@ -21,7 +21,7 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_DIR = Path(__file__).parent
+_CONFIG_DIR = Path(__file__).resolve().parent
 
 COLD_PARAMS = frozenset({
     "feed.ws_url",

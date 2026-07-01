@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 # Add fader root to path when run directly
-_FADER_ROOT = Path(__file__).parent.parent
+_FADER_ROOT = Path(__file__).resolve().parent.parent
 if str(_FADER_ROOT) not in sys.path:
     sys.path.insert(0, str(_FADER_ROOT))
 

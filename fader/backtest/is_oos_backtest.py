@@ -33,7 +33,7 @@ from backtest.metrics import compute_all_metrics
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent.parent / "DATA"
+DATA_DIR = Path(__file__).resolve().parent.parent / "DATA"
 
 IS_FRACTION = 0.70   # first 70% of calendar time
 
