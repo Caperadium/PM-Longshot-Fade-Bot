@@ -17,24 +17,10 @@ logger = logging.getLogger(__name__)
 
 def _safe_fire_alert(coro) -> None:
     """Schedule an async coroutine from a potentially sync context.
-    Uses asyncio.create_task if an event loop is running; otherwise
-    starts a background thread (safe for tests and sync callers)."""
-    try:
-        import asyncio
-        asyncio.create_task(coro)
-    except RuntimeError:
-        # No running event loop — use a thread fallback
-        import asyncio as _asyncio
-        import threading
-
-        def _run():
-            try:
-                _asyncio.run(coro)
-            except Exception:
-                pass
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
+    Delegates to infra.telegram.fire(), which retains a task ref (GC-safe)
+    and falls back to a background thread when no event loop is running."""
+    from infra import telegram
+    telegram.fire(coro)
 
 
 class RiskManager:
@@ -59,6 +45,7 @@ class RiskManager:
         self._matic_min_balance = matic_min_balance
         self._matic_balance: float = 0.0
         self._breaker_tripped = False
+        self._tripped_day: Optional[str] = None
         self._last_matic_alert_ts: float = 0.0
 
     def update_params(
@@ -79,6 +66,17 @@ class RiskManager:
 
     @property
     def breaker_tripped(self) -> bool:
+        # Daily breaker: auto-clears at UTC midnight. The DB row is keyed by
+        # day so a new day starts untripped; this clears the sticky in-memory
+        # flag to match (previously it persisted until manual reset/restart).
+        if (
+            self._breaker_tripped
+            and self._tripped_day
+            and self._tripped_day != self.today_utc()
+        ):
+            self._breaker_tripped = False
+            self._tripped_day = None
+            logger.info("Circuit breaker auto-reset (UTC day rollover)")
         return self._breaker_tripped
 
     # ------------------------------------------------------------------
@@ -121,6 +119,7 @@ class RiskManager:
         pnl = row["realized_pnl"]
         if row["tripped"]:
             self._breaker_tripped = True
+            self._tripped_day = day
             return
         # We need cash bankroll to compute %; caller must check allow_entry() which
         # uses the last-known bankroll from engine state. Here we just mark.
@@ -147,6 +146,7 @@ class RiskManager:
             return False
         if row["tripped"]:
             self._breaker_tripped = True
+            self._tripped_day = day
             return True
         pnl = row["realized_pnl"]
         loss_pct = (-pnl / cash_bankroll) * 100 if pnl < 0 else 0.0
@@ -171,6 +171,7 @@ class RiskManager:
         finally:
             conn.close()
         self._breaker_tripped = True
+        self._tripped_day = day
         logger.error(f"Circuit breaker TRIPPED for {day}")
         from infra import telegram
         _safe_fire_alert(telegram.alert_breaker_tripped(self._daily_loss_pct, day))
@@ -192,6 +193,7 @@ class RiskManager:
         finally:
             conn.close()
         self._breaker_tripped = False
+        self._tripped_day = None
         logger.info(f"Circuit breaker reset for {day}")
 
     # ------------------------------------------------------------------
@@ -214,7 +216,7 @@ class RiskManager:
           3. Market deployed + order <= per_market_cap_pct of cash.
         """
         # MATIC gate removed — CLOB orders are off-chain signed messages, no gas needed.
-        if self._breaker_tripped:
+        if self.breaker_tripped:  # property: handles UTC day rollover
             return False, "circuit_breaker_tripped"
         if cash_bankroll <= 0:
             return False, "zero_bankroll"

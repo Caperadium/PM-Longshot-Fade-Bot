@@ -40,6 +40,17 @@ class StalenessTracker:
             self._gap_halt_ts = None
             logger.info("Gap halt cleared — ws feed resumed")
 
+    def mark_alive(self) -> None:
+        """Reset the feed-wide silence clock without touching any single
+        contract. Call on every WS (re)connect BEFORE resync so the
+        feed-silence watchdog doesn't count outage time accumulated while
+        disconnected against the freshly-reconnected (healthy) socket."""
+        self._feed_last_update = time.monotonic()
+        if self._gap_halted:
+            self._gap_halted = False
+            self._gap_halt_ts = None
+            logger.info("Gap halt cleared — ws feed resumed")
+
     def is_stale(self, token_id: str) -> bool:
         """True if no update received within max_staleness_s."""
         last = self._last_update.get(token_id)

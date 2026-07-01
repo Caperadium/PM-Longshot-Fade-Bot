@@ -42,7 +42,7 @@ def _default_progress(msg: str) -> None:
 
 CLOB_PRICES_URL = "https://clob.polymarket.com/prices-history"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-DATA_DIR = Path(__file__).parent.parent / "DATA"
+DATA_DIR = Path(__file__).resolve().parent.parent / "DATA"
 PRICES_CSV = DATA_DIR / "historical_prices.csv"
 MAX_RETRIES = 3
 CHECKPOINT_EVERY = 100  # save store every N fetched markets (interrupt safety)

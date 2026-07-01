@@ -62,6 +62,7 @@ class StrategyLoop:
         self._token_map: Dict[str, Any] = {}  # slug -> MarketInfo
         self._order_manager = None
         self._bankroll: float = 0.0
+        self._bankroll_fn = None  # optional live source (e.g. reconciler.bankroll)
         self._volume_cache: Dict[str, Dict[str, float]] = {}
         self._volume_cache_ts: Dict[str, float] = {}
         self._volume_ttl_s: float = 300.0
@@ -79,10 +80,27 @@ class StrategyLoop:
     def set_bankroll(self, bankroll: float) -> None:
         self._bankroll = bankroll
 
+    def set_bankroll_source(self, fn) -> None:
+        """Live bankroll callable — read each tick so risk caps and the
+        breaker track the poller-reconciled balance instead of the value
+        captured at startup."""
+        self._bankroll_fn = fn
+
+    @property
+    def bankroll(self) -> float:
+        if self._bankroll_fn is not None:
+            try:
+                return float(self._bankroll_fn())
+            except Exception:
+                return self._bankroll
+        return self._bankroll
+
     def set_series_slugs(self, slugs: List[str]) -> None:
         self._series_slugs = slugs
 
     async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            return  # already running (idempotent for the 'start' command)
         self._running = True
         self._task = asyncio.create_task(self._loop())
 
@@ -115,8 +133,14 @@ class StrategyLoop:
         if cfg.mode != "paper" and self._staleness.check_gap_halt():
             return
 
-        # Load deployment state once per tick
+        # Load deployment state once per tick. Resting limit notional counts
+        # against the caps too — unfilled limits have no position row yet.
         total_deployed, by_slug = get_open_notional()
+        if self._order_manager is not None:
+            resting_total, resting_by_slug = self._order_manager.resting_exposure()
+            total_deployed += resting_total
+            for s, n in resting_by_slug.items():
+                by_slug[s] = by_slug.get(s, 0.0) + n
 
         # --- Main slug loop (slugs.csv entries with per-slug config) ---
         for slug_row in cfg.enabled_slugs():
@@ -273,15 +297,16 @@ class StrategyLoop:
             fn = make_sizing_fn(alpha, band_low, band_high)
             notional = max(MIN_EFFECTIVE_NOTIONAL, notional * fn(ask_f))
         market_deployed = by_slug.get(slug, 0.0)
+        bankroll = self.bankroll  # live source when wired (set_bankroll_source)
         allowed, risk_reason = self._risk.allow_entry(
-            slug, notional, self._bankroll, total_deployed, market_deployed
+            slug, notional, bankroll, total_deployed, market_deployed
         )
         if not allowed:
             if log_decisions:
                 log_rejected(slug, token_id, "risk_cap", {"risk_reason": risk_reason})
             return (0.0, 0.0)
 
-        if self._risk.check_breaker_against_bankroll(self._bankroll):
+        if self._risk.check_breaker_against_bankroll(bankroll):
             if log_decisions:
                 log_rejected(slug, token_id, "circuit_breaker", {})
             return (0.0, 0.0)
@@ -335,7 +360,7 @@ class StrategyLoop:
             if dte is not None:
                 return dte
         # Fallback: Gamma API
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             return await loop.run_in_executor(None, lambda: compute_dte(slug))
         except Exception:
@@ -346,7 +371,7 @@ class StrategyLoop:
         cached_ts = self._volume_cache_ts.get(slug, 0.0)
         if now - cached_ts < self._volume_ttl_s and slug in self._volume_cache:
             return self._volume_cache[slug]
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             vols = await loop.run_in_executor(None, lambda: fetch_volumes(slug))
         except Exception:

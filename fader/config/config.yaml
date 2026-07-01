@@ -19,6 +19,12 @@ feed:
   max_staleness_seconds: 30
   gap_halt_seconds: 60
   ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  ws_force_reconnect_s: 90   # force WS reconnect if no feed data this long
+  ws_ping_interval_s: 10     # app-level PING cadence
+  ws_pong_timeout_s: 25      # close socket if no PONG within this (belt-and-suspenders)
+  ws_expect_pong: false      # enable pong-timeout close; default off (rely on silence watchdog)
+  resync_concurrency: 8      # bounded-concurrent REST /book resync on reconnect (restart to change)
+  executor_workers: 16       # sized ThreadPoolExecutor for blocking REST calls (restart to change)
 
 polling:
   bankroll_s: 30

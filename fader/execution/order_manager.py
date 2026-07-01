@@ -15,7 +15,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config.config_loader import AppConfig
 from execution.idempotency import make_key, is_already_submitted
@@ -63,6 +63,75 @@ class OrderManager:
         self._risk = risk  # RiskManager, for TOCTOU breaker check
         self._resting: Dict[str, RestingOrder] = {}  # token_id -> order
         self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Startup rehydrate (FIX 3) — must run after construction, before any
+    # background task starts, so _resting is fully populated before the
+    # requote loop's first pass.
+    # ------------------------------------------------------------------
+
+    async def rehydrate_resting(self) -> int:
+        """Repopulate in-memory _resting from DB PENDING LIMIT orders that
+        are still live on the exchange.
+
+        _resting is memory-only. After a restart, a live resting LIMIT
+        order sits in DB as PENDING and is seen live by the reconciler
+        (stays PENDING) but is absent from _resting -> no TTL/band-exit/
+        requote management -> orphan until filled or manually cancelled.
+        This closes that gap. Returns the count of orders rehydrated.
+
+        Paper mode: no-op (paper limits fill instantly; no resting orders).
+        """
+        if self._provider._mode == "paper":
+            return 0
+
+        live = await self._provider.async_fetch_open_orders()
+        live_by_id = {o["order_id"]: o for o in live if o.get("order_id")}
+
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT order_id, idempotency_key, slug, token_id, price, size, created_at
+                FROM orders
+                WHERE status='PENDING' AND type='LIMIT'
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        count = 0
+        for row in rows:
+            order_id = row["order_id"]
+            if order_id.startswith("SIM-") or order_id.startswith("FAKE-"):
+                continue  # paper-mode simulated; never live
+            token_id = row["token_id"]
+            if order_id not in live_by_id:
+                continue  # not live — left to the reconciler's mark_vanished path
+            if token_id in self._resting:
+                # Rows are created_at DESC: newest PENDING limit per token wins.
+                continue
+            price = float(row["price"])
+            size = float(row["size"])
+            self._resting[token_id] = RestingOrder(
+                order_id=order_id,
+                idempotency_key=row["idempotency_key"],
+                slug=row["slug"],
+                token_id=token_id,
+                price=price,
+                size=size,
+                notional=price * size,
+                placed_at=time.monotonic(),
+                ttl_s=self._cfg.orders.limit_ttl_s,
+                mid=price,  # book may not be loaded yet; requote loop recomputes
+            )
+            count += 1
+
+        if count:
+            logger.info(f"Rehydrated {count} resting limit order(s) from DB+live API")
+        return count
 
     # ------------------------------------------------------------------
     # Entry (called by strategy loop when all filters pass)
@@ -156,9 +225,7 @@ class OrderManager:
 
             logger.error(f"Market order failed for {slug}: {result.get('error')}")
             from infra import telegram
-            asyncio.create_task(
-                telegram.alert_exchange_rejection(slug, result.get("error", ""))
-            )
+            telegram.fire(telegram.alert_exchange_rejection(slug, result.get("error", "")))
             return
 
         order_id = result.get("order_id")
@@ -192,7 +259,7 @@ class OrderManager:
             f"Market order placed: {slug} {size:.4f}@{price:.4f} -> {order_id}"
         )
         from infra import telegram
-        asyncio.create_task(telegram.alert_position_opened(slug, price, actual_notional))
+        telegram.fire(telegram.alert_position_opened(slug, price, actual_notional))
 
     async def _place_limit(
         self,
@@ -240,9 +307,7 @@ class OrderManager:
         if not result.get("success"):
             logger.error(f"Limit order failed for {slug}: {result.get('error')}")
             from infra import telegram
-            asyncio.create_task(
-                telegram.alert_exchange_rejection(slug, result.get("error", ""))
-            )
+            telegram.fire(telegram.alert_exchange_rejection(slug, result.get("error", "")))
             return
 
         order_id = result.get("order_id") or idem_key
@@ -309,19 +374,52 @@ class OrderManager:
             await self._cancel_resting(token_id, "ttl_or_band_exit")
 
     async def _requote(self, order: RestingOrder, book) -> None:
-        await self._cancel_resting(order.token_id, "requote")
+        if not await self._cancel_resting(order.token_id, "requote"):
+            # Cancel failed — old order may still be live. Placing a
+            # replacement would risk two live orders (double exposure).
+            return
         mid = float(book.mid) if book.mid else float(book.best_ask)
         notional = self._cfg.size_for_slug(order.slug)
         filters: Dict = {"requote": True}
         await self._place_limit(order.slug, order.token_id, mid, float(book.best_ask), notional, filters)
 
-    async def _cancel_resting(self, token_id: str, reason: str) -> None:
+    async def _cancel_resting(self, token_id: str, reason: str) -> bool:
+        """Cancel a resting order. Returns True when the cancel was accepted.
+
+        On cancel failure the order is re-tracked in _resting so TTL/requote
+        keeps managing it and the next pass retries the cancel; if the order
+        is actually gone on the exchange the reconciler's mark_vanished pops
+        it within one resolution cycle.
+        """
         order = self._resting.pop(token_id, None)
         if order is None:
-            return
+            return True
         result = await self._provider.async_cancel_order(order.order_id)
+        if not result.get("success"):
+            self._resting[token_id] = order
+            self._update_order_status(
+                order.order_id, "UNKNOWN", f"cancel_failed:{reason}"
+            )
+            logger.warning(
+                f"Cancel FAILED for {order.order_id} ({reason}): "
+                f"{result.get('error')} — order re-tracked, will retry"
+            )
+            return False
         self._update_order_status(order.order_id, "CANCELLED", reason)
         logger.info(f"Cancelled {order.order_id} ({reason})")
+        return True
+
+    def resting_exposure(self) -> Tuple[float, Dict[str, float]]:
+        """(total_notional, {slug: notional}) of in-flight resting limit
+        orders. Counted against the deployed caps so unfilled limits can't
+        over-commit the bankroll (they don't create position rows until
+        they fill)."""
+        total = 0.0
+        by_slug: Dict[str, float] = {}
+        for o in list(self._resting.values()):
+            total += o.notional
+            by_slug[o.slug] = by_slug.get(o.slug, 0.0) + o.notional
+        return total, by_slug
 
     def mark_filled(self, order_id: str, token_id: str) -> None:
         """Called by reconciler when an order becomes filled."""
@@ -334,6 +432,34 @@ class OrderManager:
         order = self._resting.pop(token_id, None)
         if order:
             self._update_order_status(order.order_id, "UNKNOWN", "vanished_from_api")
+
+    # ------------------------------------------------------------------
+    # Graceful shutdown (FIX 5)
+    # ------------------------------------------------------------------
+
+    async def cancel_all_resting(self, reason: str = "shutdown") -> None:
+        """Cancel every resting limit order before the engine exits.
+
+        Snapshots keys under the lock, then cancels sequentially —
+        shutdown volume is tiny (one resting order per token), so a
+        racing gather-and-pop isn't worth the complexity.
+
+        Cancel-state semantics: _cancel_resting marks DB status CANCELLED
+        once the provider cancel call returns (success or not — matches
+        existing _cancel_resting behavior). Orders not yet processed if
+        the caller times out stay PENDING in DB and live on-exchange;
+        rehydrate_resting recovers them on next boot.
+        """
+        if self._provider._mode == "paper":
+            self._resting.clear()
+            return
+        async with self._lock:
+            token_ids = list(self._resting.keys())
+        for tid in token_ids:
+            try:
+                await self._cancel_resting(tid, reason)
+            except Exception as e:
+                logger.warning(f"cancel_all_resting {tid[:16]}: {e}")
 
     # ------------------------------------------------------------------
     # Close-all (emergency)
@@ -376,11 +502,24 @@ class OrderManager:
             )
             logger.error(msg)
             from infra import telegram
-            asyncio.create_task(telegram.send(f"<b>{msg}</b>"))
+            telegram.fire(telegram.send(f"<b>{msg}</b>"))
             return
 
+        failures = 0
         for row in rows:
-            await self._provider.async_market_sell(row["token_id"], row["size"])
+            result = await self._provider.async_market_sell(row["token_id"], row["size"])
+            if not result.get("success"):
+                failures += 1
+                logger.error(
+                    f"close_all sell failed for {row['token_id'][:16]}: "
+                    f"{result.get('error')}"
+                )
+        if failures:
+            from infra import telegram
+            telegram.fire(telegram.send(
+                f"<b>close_all: {failures}/{len(rows)} sells FAILED</b> — "
+                f"positions remain open, check dashboard"
+            ))
 
     # ------------------------------------------------------------------
     # DB helpers

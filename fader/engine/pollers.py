@@ -41,6 +41,7 @@ class Pollers:
             asyncio.create_task(self._bankroll_loop()),
             asyncio.create_task(self._resolution_loop()),
             asyncio.create_task(self._discovery_loop()),
+            asyncio.create_task(self._maintenance_loop()),
         ]
 
     def stop(self) -> None:
@@ -82,6 +83,39 @@ class Pollers:
                 await self._discover_new_series()
             except Exception as e:
                 logger.error(f"Discovery poll error: {e}")
+
+    async def _maintenance_loop(self) -> None:
+        """Hourly DB retention pruning.
+
+        The decisions table gets one row per in-band candidate per 1s tick,
+        which grows unbounded and fills a small VPS disk within months.
+        Keep 14 days of decisions and processed control commands.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                await loop.run_in_executor(None, self._prune_old_rows)
+            except Exception as e:
+                logger.error(f"Maintenance poll error: {e}")
+            await asyncio.sleep(3600)
+
+    @staticmethod
+    def _prune_old_rows(retention_days: int = 14) -> None:
+        from infra.db import execute_write
+        cutoff = f"-{retention_days} days"
+        n1 = execute_write(
+            "DELETE FROM decisions WHERE ts < datetime('now', ?)", (cutoff,)
+        )
+        n2 = execute_write(
+            "DELETE FROM control_commands WHERE status != 'PENDING' "
+            "AND ts < datetime('now', ?)",
+            (cutoff,),
+        )
+        if n1 or n2:
+            logger.info(
+                f"DB retention prune: {n1} decisions, {n2} control_commands "
+                f"older than {retention_days}d removed"
+            )
 
     async def _discover_new_rungs(self) -> None:
         from marketdata.rest_market import discover_new_rungs

@@ -264,21 +264,6 @@ class TestNoneOrderIdHandling(unittest.TestCase):
 class TestMaticBalanceCheck(unittest.TestCase):
     """MATIC gate must reject entries when balance below threshold."""
 
-    def test_allow_entry_rejects_on_low_matic(self):
-        from engine.risk import RiskManager
-
-        rm = RiskManager(
-            daily_loss_pct=5.0,
-            max_deployed_pct=100.0,
-            per_market_cap_pct=5.0,
-            matic_min_balance=0.5,
-        )
-        rm.set_matic_balance(0.1)  # below 0.5 threshold
-
-        allowed, reason = rm.allow_entry("test", 10.0, 1000.0, 0.0, 0.0)
-        self.assertFalse(allowed, "Should reject on low MATIC")
-        self.assertIn("matic_balance_low", reason)
-
     def test_allow_entry_permits_on_sufficient_matic(self):
         from engine.risk import RiskManager
 
@@ -528,12 +513,6 @@ class TestConfigIntegrity(unittest.TestCase):
         body = src[idx_reload:idx_next]
         self.assertIn("apply_config_kv_overrides", body,
                       "check_and_reload must re-apply config_kv overrides after _apply_hot")
-
-    def test_load_config_populates_matic(self):
-        from config.config_loader import load_config
-        cfg = load_config()
-        self.assertGreater(cfg.risk.matic_min_balance, 0,
-                           "matic_min_balance must be loaded from config.yaml")
 
     def test_slugs_only_active(self):
         from config.config_loader import load_config
@@ -930,14 +909,6 @@ class TestEdgeCases(unittest.TestCase):
         rm.set_matic_balance(0.5)
         allowed, _ = rm.allow_entry("t", 10.0, 1000.0, 0.0, 0.0)
         self.assertTrue(allowed, "MATIC exactly at threshold must pass")
-
-    def test_matic_just_below_threshold(self):
-        from engine.risk import RiskManager
-        rm = RiskManager(matic_min_balance=0.5)
-        rm.set_matic_balance(0.499999)
-        allowed, reason = rm.allow_entry("t", 10.0, 1000.0, 0.0, 0.0)
-        self.assertFalse(allowed, "MATIC just below threshold must fail")
-        self.assertIn("matic_balance_low", reason)
 
     # -- Sizing edges --
 

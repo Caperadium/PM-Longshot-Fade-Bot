@@ -21,6 +21,29 @@ _BOT_TOKEN: Optional[str] = None
 _CHAT_ID: Optional[str] = None
 _ENABLED: bool = False
 
+# Fire-and-forget task registry — prevents GC of in-flight alert tasks
+# (asyncio only holds a weak reference to tasks not retained elsewhere).
+_bg_tasks: set = set()
+
+
+def fire(coro) -> None:
+    """Fire-and-forget a telegram coroutine; retains a ref (GC-safe).
+    Falls back to a daemon thread if no event loop is running."""
+    try:
+        t = asyncio.create_task(coro)
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
+    except RuntimeError:
+        import threading
+
+        def _run():
+            try:
+                asyncio.run(coro)
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
 
 def configure(enabled: bool = True) -> None:
     global _BOT_TOKEN, _CHAT_ID, _ENABLED
@@ -51,7 +74,7 @@ def _send_sync(text: str) -> bool:
 
 
 async def send(text: str) -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _send_sync, text)
 
 

@@ -34,7 +34,18 @@ logger = logging.getLogger(__name__)
 DATA_API_BASE = "https://data-api.polymarket.com"
 CLOB_API_BASE = "https://clob.polymarket.com"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-POLYGON_RPC = "https://polygon-rpc.com"
+POLYGON_RPC_DEFAULT = "https://polygon-rpc.com"
+
+
+def _polygon_rpc_url() -> str:
+    """Polygon RPC endpoint. Override with POLYGON_RPC_URL env var.
+
+    The public default (polygon-rpc.com) is frequently rate-limited / returns
+    401, which silently zeroes on-chain balance + allowance reads. In live
+    mode a zeroed balance means allow_entry() returns 'zero_bankroll' and the
+    bot never trades — so a working RPC (Alchemy/Infura/etc.) is required.
+    """
+    return os.getenv("POLYGON_RPC_URL", "").strip() or POLYGON_RPC_DEFAULT
 USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
@@ -129,7 +140,7 @@ class Provider:
 
     async def _aget(self, url: str, params: Optional[Dict] = None) -> Any:
         await self._limiter.acquire("read")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor,
             lambda: self._request("GET", url, params=params),
@@ -193,7 +204,7 @@ class Provider:
         )
 
     async def async_resolve_no_token(self, slug: str) -> MarketInfo:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor, lambda: self.resolve_no_token(slug)
         )
@@ -217,7 +228,7 @@ class Provider:
             return 0.0
         try:
             from web3 import Web3
-            w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            w3 = Web3(Web3.HTTPProvider(_polygon_rpc_url()))
             abi = [{"inputs": [{"name": "account", "type": "address"}],
                     "name": "balanceOf",
                     "outputs": [{"name": "", "type": "uint256"}],
@@ -235,7 +246,7 @@ class Provider:
 
     async def async_fetch_usdc_balance(self) -> float:
         await self._limiter.acquire("read")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self.fetch_usdc_balance)
 
     def fetch_open_positions(self) -> List[Dict[str, Any]]:
@@ -246,7 +257,7 @@ class Provider:
 
     async def async_fetch_open_positions(self) -> List[Dict[str, Any]]:
         await self._limiter.acquire("read")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self.fetch_open_positions)
 
     def fetch_all_closed_positions(self, max_positions: int = 1000) -> List[Dict[str, Any]]:
@@ -292,7 +303,7 @@ class Provider:
 
     async def async_fetch_open_orders(self) -> List[Dict[str, Any]]:
         await self._limiter.acquire("read")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self.fetch_open_orders)
 
     # ------------------------------------------------------------------
@@ -361,6 +372,13 @@ class Provider:
             resp = client.create_and_post_order(args)
             order_id = None
             if isinstance(resp, dict):
+                # A 200 response can still carry success=false + errorMsg
+                # (e.g. FOK killed). Treat it as a rejection, not a fill.
+                if resp.get("success") is False:
+                    err = resp.get("errorMsg") or "order rejected (success=false)"
+                    logger.error(f"place_order rejected: {err}")
+                    return {"success": False, "order_id": None, "error": err,
+                            "simulated": False}
                 order_id = resp.get("orderID") or resp.get("order_id")
             elif hasattr(resp, "orderID"):
                 order_id = resp.orderID
@@ -384,7 +402,7 @@ class Provider:
         order_type: str = "LIMIT",
     ) -> Dict[str, Any]:
         await self._limiter.acquire("write")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor,
             lambda: self.place_order(token_id, side, price, size, order_type),
@@ -404,7 +422,7 @@ class Provider:
 
     async def async_cancel_order(self, order_id: str) -> Dict[str, Any]:
         await self._limiter.acquire("write")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._executor, lambda: self.cancel_order(order_id)
         )
@@ -423,7 +441,7 @@ class Provider:
 
     async def async_cancel_all(self) -> Dict[str, Any]:
         await self._limiter.acquire("write")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self.cancel_all)
 
     # ------------------------------------------------------------------
@@ -449,7 +467,7 @@ class Provider:
             return 0.0
         try:
             from web3 import Web3
-            w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            w3 = Web3(Web3.HTTPProvider(_polygon_rpc_url()))
             raw = w3.eth.get_balance(Web3.to_checksum_address(user_address))
             return raw / 10**18
         except Exception as e:
@@ -458,7 +476,7 @@ class Provider:
 
     async def async_fetch_matic_balance(self) -> float:
         await self._limiter.acquire("read")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self.fetch_matic_balance)
 
     # ------------------------------------------------------------------
@@ -472,7 +490,7 @@ class Provider:
             return 0.0
         try:
             from web3 import Web3
-            w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+            w3 = Web3(Web3.HTTPProvider(_polygon_rpc_url()))
             abi = [
                 {
                     "constant": True,
@@ -515,7 +533,7 @@ class Provider:
 
     async def async_fetch_usdc_allowance(self) -> float:
         await self._limiter.acquire("read")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self.fetch_usdc_allowance)
 
     # ------------------------------------------------------------------

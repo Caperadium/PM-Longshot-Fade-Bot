@@ -21,17 +21,12 @@ def _utc_now() -> str:
 
 
 def _set(key: str, value: Any) -> None:
-    from infra.db import get_connection
+    from infra.db import execute_write
     now = _utc_now()
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO engine_state (key, value_json, updated_at) VALUES (?, ?, ?)",
-            (key, json.dumps(value, default=str), now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    execute_write(
+        "INSERT OR REPLACE INTO engine_state (key, value_json, updated_at) VALUES (?, ?, ?)",
+        (key, json.dumps(value, default=str), now),
+    )
 
 
 class StatePublisher:

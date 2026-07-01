@@ -21,7 +21,7 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_DIR = Path(__file__).parent
+_CONFIG_DIR = Path(__file__).resolve().parent
 
 COLD_PARAMS = frozenset({
     "feed.ws_url",
@@ -55,6 +55,12 @@ class FeedConfig:
     max_staleness_seconds: int = 30
     gap_halt_seconds: int = 60
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    ws_force_reconnect_s: int = 90   # force WS reconnect if no feed data this long
+    ws_ping_interval_s: int = 10     # app-level PING cadence
+    ws_pong_timeout_s: int = 25      # close socket if no PONG within this (1a only)
+    ws_expect_pong: bool = False     # enable pong-timeout close (1a); default off
+    resync_concurrency: int = 8      # bounded-concurrent REST /book resync on reconnect (COLD)
+    executor_workers: int = 16       # sized ThreadPoolExecutor for blocking REST calls
 
 
 @dataclass
@@ -304,6 +310,12 @@ class ConfigWatcher:
         c.feed.decision_interval_s = n.feed.decision_interval_s
         c.feed.max_staleness_seconds = n.feed.max_staleness_seconds
         c.feed.gap_halt_seconds = n.feed.gap_halt_seconds
+        c.feed.ws_force_reconnect_s = n.feed.ws_force_reconnect_s
+        c.feed.ws_ping_interval_s = n.feed.ws_ping_interval_s
+        c.feed.ws_pong_timeout_s = n.feed.ws_pong_timeout_s
+        c.feed.ws_expect_pong = n.feed.ws_expect_pong
+        # NOTE: resync_concurrency and executor_workers are COLD (constructor-only) —
+        # do NOT add here.
         # Polling (all hot)
         c.polling.bankroll_s = n.polling.bankroll_s
         c.polling.resolution_s = n.polling.resolution_s

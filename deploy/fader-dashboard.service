@@ -1,0 +1,29 @@
+# systemd unit for the Streamlit dashboard (optional; separate process,
+# shares fader.db with the engine).
+#
+# Install:
+#   sudo cp deploy/fader-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fader-dashboard
+#
+# Bind to localhost and access over an SSH tunnel:
+#   ssh -L 8501:localhost:8501 user@vps
+
+[Unit]
+Description=Fader dashboard (Streamlit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fader
+WorkingDirectory=/opt/fader-bot
+ExecStart=/opt/fader-bot/.venv/bin/streamlit run fader/run_dashboard.py --server.address 127.0.0.1 --server.port 8501 --server.headless true
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

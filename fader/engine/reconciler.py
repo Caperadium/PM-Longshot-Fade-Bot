@@ -64,11 +64,13 @@ class Reconciler:
                 logger.error(f"Paper startup cleanup error: {e}")
             finally:
                 conn.close()
+        # Positions before orders: order reconcile decides FILLED-vs-UNKNOWN
+        # by looking for an open position on the order's token.
         await asyncio.gather(
             self._reconcile_bankroll(),
-            self._reconcile_orders(),
             self._reconcile_positions(),
         )
+        await self._reconcile_orders()
 
     # ------------------------------------------------------------------
     # Bankroll
@@ -126,7 +128,18 @@ class Reconciler:
             if oid.startswith("SIM-") or oid.startswith("FAKE-"):
                 continue  # paper mode simulated
             if oid not in live_ids:
-                # Not live — don't guess FILLED. Mark UNKNOWN.
+                # An open position on this token means the order filled
+                # (positions reconcile runs before this). Otherwise: not
+                # live and no position — don't guess FILLED, mark UNKNOWN.
+                if _has_open_position(token_id):
+                    if self._order_manager:
+                        self._order_manager.mark_filled(oid, token_id)
+                    else:
+                        _update_order_status(oid, "FILLED")
+                    logger.info(
+                        f"Order {oid[:16]} no longer live + position open — FILLED"
+                    )
+                    continue
                 _update_order_status(oid, "UNKNOWN")
                 # Also pop from OrderManager._resting so re-entry isn't blocked
                 if self._order_manager:
@@ -150,7 +163,7 @@ class Reconciler:
             return
         from infra.db import get_connection
         api_positions = await self._provider.async_fetch_open_positions()
-        api_closed = await asyncio.get_event_loop().run_in_executor(
+        api_closed = await asyncio.get_running_loop().run_in_executor(
             None, self._provider.fetch_all_closed_positions
         )
 
@@ -190,9 +203,7 @@ class Reconciler:
                         logger.info(f"Position {pos_id[:24]} closed; PnL={pnl:.4f}")
                         from infra import telegram
                         slug = cpos.get("slug", cpos.get("marketSlug", "?"))
-                        asyncio.create_task(
-                            telegram.alert_position_resolved(slug, pnl)
-                        )
+                        telegram.fire(telegram.alert_position_resolved(slug, pnl))
 
             conn.commit()
         except Exception as e:
@@ -224,7 +235,8 @@ def _import_position(conn, pos: Dict, pos_id: str, user: str) -> None:
             pos_id,
             pos.get("slug", pos.get("marketSlug", "")),
             pos.get("conditionId", ""),
-            pos.get("asset_id", pos.get("tokenId", "")),
+            # Data-API /positions returns the ERC1155 token id under "asset".
+            pos.get("asset", pos.get("asset_id", pos.get("tokenId", ""))),
             pos.get("outcome", ""),
             float(pos.get("avgPrice", pos.get("curPrice", 0)) or 0),
             float(pos.get("size", pos.get("totalBought", 0)) or 0),
@@ -232,6 +244,19 @@ def _import_position(conn, pos: Dict, pos_id: str, user: str) -> None:
             now,
         ),
     )
+
+
+def _has_open_position(token_id: str) -> bool:
+    from infra.db import get_connection
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM positions WHERE token_id=? AND status='OPEN' LIMIT 1",
+            (token_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 
 def _update_order_status(order_id: str, status: str) -> None:
@@ -247,20 +272,12 @@ def _update_order_status(order_id: str, status: str) -> None:
 
 
 def _set_state(key: str, value: Any) -> None:
-    from infra.db import get_connection
+    from infra.db import execute_write
     now = _utc_now()
-    conn = get_connection()
-    try:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO engine_state (key, value_json, updated_at)
-            VALUES (?, ?, ?)
-            """,
-            (key, json.dumps(value), now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    execute_write(
+        "INSERT OR REPLACE INTO engine_state (key, value_json, updated_at) VALUES (?, ?, ?)",
+        (key, json.dumps(value), now),
+    )
 
 
 def _get_env(key: str) -> str:
