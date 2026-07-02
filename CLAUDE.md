@@ -59,7 +59,7 @@ Requires `.env` with `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_USER_ADDRESS`, and op
 |---|---|---|
 | Strategy loop | 1s | 11-filter evaluation, calls OrderManager.enter() |
 | Bankroll poller | 30s | Reconcile USDC/MATIC balances, USDC allowance |
-| Resolution poller | 60s | Detect closed/resolved positions, book PnL |
+| Resolution poller | 60s | Detect closed/resolved positions, book PnL (live: Data API; paper: polls Gamma `/markets?slug=` per open position, see below) |
 | Discovery poller | 300s | Discover new rung markets (ladder + daily series) |
 | State publisher | 2s | Write engine state to DB for dashboard |
 | Control consumer | 1s | Process dashboard commands (stop, close_all, etc.) |
@@ -170,9 +170,11 @@ Single YAML file at `fader/config/config.yaml`. Hot-reloaded by ConfigWatcher (5
 
 SQLite in WAL mode. Both engine and dashboard read/write concurrently. Idempotency keys prevent duplicate orders on restart. Engine state published to `engine_state` KV table; dashboard commands go through `control_commands` table.
 
+**Paper positions persist across restarts.** Unlike earlier behavior (startup used to bulk-close every OPEN paper position with `realized_pnl=0.0`), the engine no longer wipes paper state on boot. `Reconciler._reconcile_paper_resolutions()` (delegated from `_reconcile_positions()` in paper mode, so it runs both on startup and every 60s resolution poll) polls Gamma per open paper position's slug and closes resolved ones with real signed PnL — unresolved positions stay OPEN, same as the bot holding them live. To start a fresh paper session, stop the engine and delete `fader/fader.db`.
+
 ## Known issues
 
-- **`error.md`**: Resolved — `use_container_width` deprecation fixed (all instances → `width='stretch'`).
+- **`error.md`**: Resolved — `use_container_width` deprecation fixed (all instances → `width='stretch'`); STOP/CLOSE-ALL session-state crash fixed (widget-keyed state must be written via `on_click` callbacks, see dashboard/app.py).
 
 ## Original spec
 

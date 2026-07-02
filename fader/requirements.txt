@@ -6,6 +6,6 @@ py-clob-client>=0.18.0
 web3>=6.0.0
 python-dotenv>=1.0.0
 pyyaml>=6.0.1
-streamlit>=1.32.0
+streamlit>=1.44.0
 python-telegram-bot>=21.0
 plotly>=5.18.0

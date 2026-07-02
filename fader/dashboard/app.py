@@ -211,26 +211,40 @@ elif proc_active and not engine_running:
     if st.sidebar.button("Check Status", width='stretch'):
         st.rerun()
 else:
-    # Engine is running — show stop/breaker controls
+    # Engine is running — show stop/breaker controls.
+    # Widget-keyed session state (the confirm checkboxes) can only be
+    # written from an on_click callback, which runs before widgets are
+    # instantiated on the rerun; writing it in the button body raises
+    # StreamlitAPIException. Success messages go through a flash slot so
+    # they render on the rerun the callback triggers.
+    def _issue_stop() -> None:
+        issue_command("stop")
+        st.session_state.confirm_stop = False
+        st.session_state.control_flash = "Stop issued"
+
+    def _issue_close_all() -> None:
+        issue_command("close_all")
+        st.session_state.confirm_close_all = False
+        st.session_state.control_flash = "Close-all issued"
+
+    flash = st.session_state.pop("control_flash", None)
+    if flash:
+        st.sidebar.success(flash)
+
     stop_confirm = st.sidebar.checkbox("Confirm STOP Engine", key="confirm_stop")
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        if st.button("STOP Engine", type="primary", disabled=not stop_confirm, width='stretch'):
-            issue_command("stop")
-            st.session_state.confirm_stop = False
-            st.sidebar.success("Stop issued")
-            st.rerun()
+        st.button("STOP Engine", type="primary", disabled=not stop_confirm,
+                  width='stretch', on_click=_issue_stop)
     with col2:
         if st.button("Reset Breaker", width='stretch'):
             issue_command("breaker_reset")
             st.sidebar.success("Breaker reset")
 
     close_confirm = st.sidebar.checkbox("Confirm CLOSE ALL Positions", key="confirm_close_all")
-    if st.sidebar.button("CLOSE ALL Positions", type="secondary", disabled=not close_confirm, width='stretch'):
-        issue_command("close_all")
-        st.session_state.confirm_close_all = False
-        st.sidebar.success("Close-all issued")
-        st.rerun()
+    st.sidebar.button("CLOSE ALL Positions", type="secondary",
+                      disabled=not close_confirm, width='stretch',
+                      on_click=_issue_close_all)
 
     if st.sidebar.button("Reload Config", width='stretch'):
         issue_command("config_reload")

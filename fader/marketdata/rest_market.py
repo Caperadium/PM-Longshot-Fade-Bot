@@ -70,10 +70,18 @@ def fetch_market_metadata(slug: str) -> Optional[Dict[str, Any]]:
     """
     Gamma /markets?slug= for a single slug.
     Returns the first matching market dict, or None.
+
+    Gamma excludes closed markets from a plain slug query, so a miss is
+    retried with closed=true — required by paper resolution polling, which
+    exists precisely to find positions whose market has closed.
     """
     try:
         data = _get(GAMMA_MARKETS_URL, params={"slug": slug})
         markets = data if isinstance(data, list) else data.get("markets", [])
+        if not markets:
+            time.sleep(CALL_DELAY_S)
+            data = _get(GAMMA_MARKETS_URL, params={"slug": slug, "closed": "true"})
+            markets = data if isinstance(data, list) else data.get("markets", [])
         return markets[0] if markets else None
     except Exception as e:
         logger.warning(f"fetch_market_metadata({slug}): {e}")

@@ -372,6 +372,7 @@ async def run() -> None:
                 cfg.feed.ws_pong_timeout_s,
                 cfg.feed.ws_expect_pong,
             )
+            await order_manager.cancel_resting_for_disabled_slugs()
 
     control = ControlConsumer(
         poll_s=cfg.polling.control_poll_s,
@@ -403,6 +404,7 @@ async def run() -> None:
                         cfg.feed.ws_expect_pong,
                     )
                     strategy_loop.set_bankroll(reconciler.bankroll)
+                    await order_manager.cancel_resting_for_disabled_slugs()
             except Exception as e:
                 logger.error(f"Config watch error: {e}")
             await asyncio.sleep(5.0)

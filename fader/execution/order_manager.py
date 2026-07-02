@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from config.config_loader import AppConfig
 from execution.idempotency import make_key, is_already_submitted
 from execution.sizing import compute_shares_and_notional
+from marketdata.rest_market import _derive_series_filter
 from persistence.decision_log import log_entered, log_rejected
 
 logger = logging.getLogger(__name__)
@@ -171,7 +172,10 @@ class OrderManager:
                 mid = book.mid
                 if mid is None:
                     mid = ask
-                await self._place_limit(slug, token_id, float(mid), float(ask), notional, filters)
+                await self._place_limit(
+                    slug, token_id, float(mid), float(ask), notional, filters,
+                    market_info=market_info,
+                )
 
     async def _place_market(
         self,
@@ -233,9 +237,12 @@ class OrderManager:
 
         # Gate position insert: only when we have a real order_id
         if order_id is not None:
+            # Paper mode has no exchange to fill against and the reconciler
+            # skips SIM- orders, so a PENDING row would stay PENDING forever.
+            # A simulated market order is an instant fill by definition.
             self._save_order(
                 order_id, idem_key, slug, token_id, price, size, "MARKET",
-                status="PENDING",
+                status="FILLED" if is_simulated else "PENDING",
             )
             log_entered(slug, token_id, filters, order_id, idem_key)
             # Immediately insert position row so _has_open_position returns
@@ -269,6 +276,7 @@ class OrderManager:
         ask: float,
         notional: float,
         filters: Dict[str, Any],
+        market_info=None,  # MarketInfo, for position insert (paper fill only)
     ) -> None:
         # Paper mode: no matching engine exists to fill limit orders.
         # Simulate immediate fill so positions track and re-entry is blocked.
@@ -286,7 +294,7 @@ class OrderManager:
             log_entered(slug, token_id, filters, order_id, idem_key)
             self._insert_position(
                 slug, token_id, price, size, actual_notional,
-                order_id, idem_key, None,
+                order_id, idem_key, market_info,
             )
             logger.info(
                 f"[PAPER] Simulated fill: {slug} {size:.4f}@{price:.4f} -> {order_id}"
@@ -421,6 +429,49 @@ class OrderManager:
             by_slug[o.slug] = by_slug.get(o.slug, 0.0) + o.notional
         return total, by_slug
 
+    async def cancel_resting_for_disabled_slugs(self) -> int:
+        """Cancel resting limit orders whose slug is no longer enabled.
+
+        Called after a config hot-reload so disabling a slug in slugs.csv
+        (or the dashboard multiselect) pulls its live limit orders instead
+        of leaving them to die on TTL. Series children match by
+        series_filter substring — same rule as discovery and backtest
+        expansion. Returns the number of cancels accepted.
+        """
+        enabled_exact: set = set()
+        enabled_filters: List[str] = []
+        for row in self._cfg.enabled_slugs():
+            if row.market_kind in ("series", "btc_daily"):
+                enabled_filters.append(
+                    (row.series_filter or _derive_series_filter(row.slug)).lower()
+                )
+            else:
+                enabled_exact.add(row.slug)
+
+        def _enabled(slug: str) -> bool:
+            # Discovery lowercases slugs for comparison but stores original
+            # case (P4) -- lowercase both sides so mixed-case slugs still
+            # match a lowercase filter.
+            slug_lower = slug.lower()
+            return slug in enabled_exact or any(
+                f in slug_lower for f in enabled_filters
+            )
+
+        async with self._lock:
+            to_cancel = [
+                tid for tid, o in self._resting.items() if not _enabled(o.slug)
+            ]
+        n = 0
+        for tid in to_cancel:
+            try:
+                if await self._cancel_resting(tid, "slug_disabled"):
+                    n += 1
+            except Exception as e:
+                logger.warning(f"cancel_resting_for_disabled_slugs {tid[:16]}: {e}")
+        if n:
+            logger.info(f"Cancelled {n} resting order(s) on disabled slug(s)")
+        return n
+
     def mark_filled(self, order_id: str, token_id: str) -> None:
         """Called by reconciler when an order becomes filled."""
         self._resting.pop(token_id, None)
@@ -466,13 +517,37 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     async def close_all(self) -> None:
-        """Cancel all resting orders, then market-sell every open position.
+        """Cancel all resting orders, then close every open position.
 
-        Pre-flight: checks USDC.e allowance is sufficient for SELL transfers.
-        Aborts with Telegram alert if allowance is too low.
+        Live mode: market-sells each open position. Pre-flight checks
+        USDC.e allowance is sufficient for SELL transfers; aborts with
+        Telegram alert if allowance is too low.
+
+        Paper mode: there is no venue to sell into, and with paper
+        positions now persisting across restarts (D3) nothing else would
+        ever close them — mark every OPEN row CLOSED directly at
+        realized_pnl=0.0 (exit-at-entry; any other mark would be invented)
+        instead of running the allowance/sell path below (M1).
         """
         await self._provider.async_cancel_all()
         self._resting.clear()
+
+        if self._provider._mode == "paper":
+            from infra.db import get_connection
+            conn = get_connection()
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                cur = conn.execute(
+                    "UPDATE positions SET status='CLOSED', realized_pnl=0.0, "
+                    "resolved_at=? WHERE status='OPEN'",
+                    (now,),
+                )
+                conn.commit()
+                n = cur.rowcount
+            finally:
+                conn.close()
+            logger.info(f"[PAPER] close_all: closed {n} open position(s)")
+            return
 
         from infra.db import get_connection
         conn = get_connection()
@@ -575,13 +650,19 @@ class OrderManager:
 
         Uses the canonical position_id = {user}:{condition_id}:{outcome_index}
         so the reconciler's INSERT OR IGNORE will skip this row if it sees
-        the same position later.
+        the same position later. Without market_info (e.g. paper limit
+        fills before that plumbing existed) condition_id/outcome_index are
+        unknown for every market, which would collide all paper limit
+        fills onto the single id f"{user}::0" (P3/D6) — token_id is unique
+        per market+outcome, so fall back to that instead.
         """
         import os
         user = os.getenv("POLYMARKET_USER_ADDRESS", "")
+        if market_info:
+            position_id = f"{user}:{market_info.condition_id}:{market_info.outcome_index}"
+        else:
+            position_id = f"{user}:{token_id}:0"
         cid = market_info.condition_id if market_info else ""
-        oidx = market_info.outcome_index if market_info else 0
-        position_id = f"{user}:{cid}:{oidx}"
 
         from infra.db import get_connection
         now = datetime.now(timezone.utc).isoformat()

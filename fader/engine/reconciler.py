@@ -13,10 +13,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from engine.risk import RiskManager
+from marketdata.rest_market import (
+    CALL_DELAY_S,
+    _resolution_from_outcome_prices,
+    fetch_market_metadata,
+)
+
+# Cap on open paper positions polled per resolution cycle (D4). ~20 open
+# positions today; 100 leaves headroom without risking a slow Gamma sweep
+# blocking the 60s resolution poller for multiple cycles.
+MAX_PAPER_POLL_PER_CYCLE = 100
 
 logger = logging.getLogger(__name__)
 
@@ -39,31 +50,14 @@ class Reconciler:
     async def full_reconcile(self) -> None:
         """Run on startup + periodically to re-sync with API.
 
-        In paper mode: close any leftover OPEN positions from previous sessions
-        (paper positions have no on-chain resolution path) so the dashboard
-        shows a clean slate.
+        Paper positions PERSIST across restarts (D3): they have no on-chain
+        resolution path of their own, so _reconcile_positions' paper branch
+        delegates to _reconcile_paper_resolutions, which polls Gamma per
+        open position's slug and closes resolved ones with real PnL.
+        Unresolved positions stay OPEN — the bot still holds them. There is
+        no more "clean slate" zero-close on startup; delete fader.db for a
+        fresh paper session.
         """
-        if self._provider._mode == "paper":
-            from infra.db import get_connection
-            conn = get_connection()
-            try:
-                now_iso = _utc_now()
-                result = conn.execute(
-                    "UPDATE positions SET status='CLOSED', realized_pnl=0.0, "
-                    "resolved_at=? WHERE status='OPEN'",
-                    (now_iso,),
-                )
-                n = result.rowcount
-                if n > 0:
-                    conn.commit()
-                    logger.info(
-                        f"Paper mode startup: closed {n} stale position(s) "
-                        f"from previous sessions"
-                    )
-            except Exception as e:
-                logger.error(f"Paper startup cleanup error: {e}")
-            finally:
-                conn.close()
         # Positions before orders: order reconcile decides FILLED-vs-UNKNOWN
         # by looking for an open position on the order's token.
         await asyncio.gather(
@@ -156,10 +150,12 @@ class Reconciler:
         """
         Import open positions from Data API; check closed positions for resolution PnL.
 
-        In paper mode this is a no-op: paper positions have no on-chain counterpart
-        and the real API would import stale live positions into the paper session.
+        Paper positions have no Data-API counterpart (importing from the
+        real API would pull stale live positions into the paper session),
+        so paper mode delegates to Gamma-based resolution polling instead.
         """
         if self._provider._mode == "paper":
+            await self._reconcile_paper_resolutions()
             return
         from infra.db import get_connection
         api_positions = await self._provider.async_fetch_open_positions()
@@ -210,6 +206,95 @@ class Reconciler:
             logger.error(f"reconcile_positions: {e}", exc_info=True)
         finally:
             conn.close()
+
+    async def _reconcile_paper_resolutions(self) -> None:
+        """Paper-mode resolution polling (D1/D3).
+
+        Paper positions have no Data-API record; the only ground truth for
+        "has this market resolved, and who won" is Gamma /markets?slug=.
+        Poll each open paper position's slug (capped, rate-limited — D4),
+        derive the winner, and close positions whose market has resolved
+        with real PnL (D2) — same risk/alert path as the live close (D5).
+        Never raises: this runs inside the 60s resolution poller and must
+        not take the loop down on a bad response.
+        """
+        try:
+            from infra.db import get_connection
+
+            conn = get_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT position_id, slug, outcome, entry_price, size "
+                    "FROM positions WHERE status='OPEN' LIMIT ?",
+                    (MAX_PAPER_POLL_PER_CYCLE,),
+                ).fetchall()
+            finally:
+                conn.close()
+
+            if not rows:
+                return
+
+            # requests is sync — run the Gamma sweep off the event loop.
+            def _fetch_all() -> Dict[str, Optional[Dict[str, Any]]]:
+                out: Dict[str, Optional[Dict[str, Any]]] = {}
+                for i, row in enumerate(rows):
+                    if i > 0:
+                        time.sleep(CALL_DELAY_S)
+                    out[row["position_id"]] = fetch_market_metadata(row["slug"])
+                return out
+
+            meta_by_pos = await asyncio.get_running_loop().run_in_executor(
+                None, _fetch_all
+            )
+
+            conn = get_connection()
+            try:
+                for row in rows:
+                    meta = meta_by_pos.get(row["position_id"])
+                    if not meta:
+                        continue  # market metadata unavailable — leave OPEN
+                    # Gamma returns outcomes/outcomePrices as JSON strings.
+                    raw_outcomes = meta.get("outcomes", "[]")
+                    outcomes = (
+                        json.loads(raw_outcomes)
+                        if isinstance(raw_outcomes, str)
+                        else raw_outcomes
+                    )
+                    winner = _resolution_from_outcome_prices(
+                        outcomes, meta.get("outcomePrices"), meta.get("closed")
+                    )
+                    if not winner:
+                        continue  # not resolved / unusable data — leave OPEN
+
+                    held = (row["outcome"] or "").strip().upper()
+                    payout = 1.0 if held == winner else 0.0
+                    entry_price = float(row["entry_price"])
+                    size = float(row["size"])
+                    pnl = (payout - entry_price) * size
+
+                    cur = conn.execute(
+                        """
+                        UPDATE positions SET status='CLOSED', realized_pnl=?,
+                            resolved_at=?
+                        WHERE position_id=? AND status='OPEN'
+                        """,
+                        (pnl, _utc_now(), row["position_id"]),
+                    )
+                    if cur.rowcount > 0:
+                        self._risk.record_pnl_event(pnl)
+                        logger.info(
+                            f"[PAPER] Position {row['position_id'][:24]} "
+                            f"resolved ({winner}); PnL={pnl:.4f}"
+                        )
+                        from infra import telegram
+                        telegram.fire(
+                            telegram.alert_position_resolved(row["slug"], pnl)
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"reconcile_paper_resolutions: {e}", exc_info=True)
 
 
 # ------------------------------------------------------------------
