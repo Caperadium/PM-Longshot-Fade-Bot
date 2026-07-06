@@ -1,6 +1,6 @@
 slug,enabled,market_kind,series_from_date,series_filter,band_low,band_high,size_override,added_at,notes
 bitcoin-above-on,1,series,2024-01-01,bitcoin-above,,,,2026-06-27,BTC daily series all dates
 highest-temperature-in-seoul-on,0,series,2025-12-01,highest-temperature-in-seoul,,,,2026-06-28,Seoul daily weather series
-ethereum-above-on,1,series,2025-01-01,ethereum-above,,,,2026-06-29,ETH daily series all dates
-solana-above-on,1,series,2025-01-01,solana-above,,,,2026-07-01,SOL daily series all dates
-xrp-above-on,1,series,2025-01-01,xrp-above,,,,2026-07-01,XRP daily series all dates
+ethereum-above-on,0,series,2025-01-01,ethereum-above,,,,2026-06-29,ETH daily series all dates
+solana-above-on,0,series,2025-01-01,solana-above,,,,2026-07-01,SOL daily series all dates
+xrp-above-on,0,series,2025-01-01,xrp-above,,,,2026-07-01,XRP daily series all dates
