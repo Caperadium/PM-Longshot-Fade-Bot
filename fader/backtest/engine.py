@@ -67,10 +67,28 @@ class BacktestTrade:
     # "worst intraday price."
 
 
-def compute_dte_from_dates(entry_date: str, end_date: str) -> Optional[float]:
+def _to_utc_date(val):
+    """Convert a date *val* to a timezone-aware UTC datetime.
+
+    Handles ``str`` (``YYYY-MM-DD``), :class:`datetime.datetime`, and
+    :class:`pandas.Timestamp` inputs.
+    """
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    # str, pandas.Timestamp, or anything with a str() that looks like a date
+    return datetime.strptime(str(val)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def compute_dte_from_dates(entry_date, end_date) -> Optional[float]:
+    """Days-to-expiry between *entry_date* and *end_date*.
+
+    Accepts ``str``, :class:`~datetime.datetime`, or :class:`~pandas.Timestamp`.
+    """
     try:
-        entry = datetime.strptime(entry_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        entry = _to_utc_date(entry_date)
+        end = _to_utc_date(end_date)
         return max(0.0, (end - entry).days)
     except Exception:
         return None
