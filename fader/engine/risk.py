@@ -7,6 +7,7 @@ All caps key off cash bankroll (USDC.e on-chain).
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
@@ -86,10 +87,19 @@ class RiskManager:
     def today_utc(self) -> str:
         return datetime.now(timezone.utc).date().isoformat()
 
-    def record_pnl_event(self, pnl_delta: float) -> None:
-        """Add realized PnL (positive=win, negative=loss) to today's tally."""
+    def record_pnl_event(
+        self, pnl_delta: float, conn: Optional[sqlite3.Connection] = None
+    ) -> None:
+        """Add realized PnL (positive=win, negative=loss) to today's tally.
+
+        If *conn* is provided the caller owns the transaction lifecycle
+        (commit + close); otherwise a new connection is opened, committed,
+        and closed internally.
+        """
         day = self.today_utc()
-        conn = get_connection()
+        own_conn = conn is None
+        if own_conn:
+            conn = get_connection()
         try:
             conn.execute(
                 """
@@ -100,9 +110,11 @@ class RiskManager:
                 """,
                 (day, pnl_delta),
             )
-            conn.commit()
+            if own_conn:
+                conn.commit()
         finally:
-            conn.close()
+            if own_conn:
+                conn.close()
         self._check_breaker(day)
 
     def _check_breaker(self, day: str) -> None:

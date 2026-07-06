@@ -195,7 +195,7 @@ class Reconciler:
                     if conn.execute(
                         "SELECT changes()"
                     ).fetchone()[0] > 0:
-                        self._risk.record_pnl_event(pnl)
+                        self._risk.record_pnl_event(pnl, conn)
                         logger.info(f"Position {pos_id[:24]} closed; PnL={pnl:.4f}")
                         from infra import telegram
                         slug = cpos.get("slug", cpos.get("marketSlug", "?"))
@@ -281,7 +281,7 @@ class Reconciler:
                         (pnl, _utc_now(), row["position_id"]),
                     )
                     if cur.rowcount > 0:
-                        self._risk.record_pnl_event(pnl)
+                        self._risk.record_pnl_event(pnl, conn)
                         logger.info(
                             f"[PAPER] Position {row['position_id'][:24]} "
                             f"resolved ({winner}); PnL={pnl:.4f}"
