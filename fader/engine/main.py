@@ -60,7 +60,7 @@ from engine.control_consumer import ControlConsumer
 logger = logging.getLogger(__name__)
 
 
-async def run() -> None:
+async def run() -> int:
     # ------------------------------------------------------------------
     # 1. Config + DB
     # ------------------------------------------------------------------
@@ -340,11 +340,21 @@ async def run() -> None:
     # Config watcher
     config_watcher = ConfigWatcher(cfg)
 
+    # Process-lifecycle signalling. stop_event is set by SIGINT/SIGTERM or by
+    # the stop/restart control commands; restart_requested distinguishes a
+    # cold-restart (exit 42 -> supervisor relaunches) from a plain shutdown.
+    stop_event = asyncio.Event()
+    restart_requested = {"flag": False}
+
     # Control consumer
     async def on_command(cmd: str, args: Dict) -> None:
         if cmd == "stop":
             logger.info("Stop command received")
             await strategy_loop.stop()
+        elif cmd == "restart":
+            logger.info("Restart command received — graceful shutdown + cold start")
+            restart_requested["flag"] = True
+            stop_event.set()
         elif cmd == "start":
             logger.info("Start command received")
             await strategy_loop.start()
@@ -437,8 +447,6 @@ async def run() -> None:
 
     # Keep running until cancelled
     try:
-        stop_event = asyncio.Event()
-
         def _handle_signal(*_):
             stop_event.set()
 
@@ -472,15 +480,23 @@ async def run() -> None:
     state_pub.stop()
     control.stop()
     heartbeat.stop()
-    await telegram.alert_stop("graceful shutdown")
+    await telegram.alert_stop(
+        "cold restart" if restart_requested["flag"] else "graceful shutdown"
+    )
     executor.shutdown(wait=False)
+
+    # Sentinel 42 tells the supervisor (systemd Restart=always / the Windows
+    # run_engine_supervised.py wrapper) to relaunch — a full cold start that
+    # re-runs load_dotenv, telegram.configure and full_reconcile.
+    return 42 if restart_requested["flag"] else 0
 
 
 def main() -> None:
     try:
-        asyncio.run(run())
+        code = asyncio.run(run())
     except KeyboardInterrupt:
-        pass
+        code = 0
+    sys.exit(code or 0)
 
 
 if __name__ == "__main__":
