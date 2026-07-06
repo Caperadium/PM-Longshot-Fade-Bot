@@ -30,6 +30,9 @@ python -c "import sys; sys.path.insert(0,'fader'); from backtest.grid_sweep impo
 # IS/OOS backtest (in-sample / out-of-sample validation)
 python -c "import sys; sys.path.insert(0,'fader'); from backtest.is_oos_backtest import main; main()"
 
+# Crypto parameter sweep (BTC/ETH/SOL/XRP, band_low x alpha x DTE grid + walk-forward OOS)
+python -c "import sys; sys.path.insert(0,'fader'); from backtest.crypto_sweep import main; main()"
+
 # Tests
 python -m pytest fader/tests/test_live_readiness.py -v
 python -m pytest fader/tests/test_allocation_analysis.py -v
@@ -147,6 +150,7 @@ Current series:
 | `backtest/allocation_analysis.py` | Full α-sweep: monotonicity, concavity, paired CIs |
 | `backtest/grid_sweep.py` | Grid sweep backtest for parameter search |
 | `backtest/is_oos_backtest.py` | IS/OOS (in-sample / out-of-sample) backtest validation |
+| `backtest/crypto_sweep.py` | Per-market grid sweep (band_low x alpha x DTE) for BTC/ETH/SOL/XRP + walk-forward OOS validation of top configs |
 
 ## Config
 
@@ -179,3 +183,51 @@ SQLite in WAL mode. Both engine and dashboard read/write concurrently. Idempoten
 ## Original spec
 
 `Prompt.txt` contains the full original specification from which this bot was built. Reference it for design intent questions.
+
+## Change Logging & Documentation
+After completing a task, do the following:
+
+1. Append a single entry to `CHANGES.md` per logical task (not per file). Describe the intent and scope of the change, including which files were affected if relevant. Use present tense.
+
+2. Check whether any of the following need updating and update them if so:
+   - `CLAUDE.md` — architecture notes, file structure, conventions, anything describing how the project works
+   - Anything in the DOCS folder — comprehensive MKdocs files with ALL information about the project
+
+   Only update sections the change actually affects. Do not rewrite accurate sections.
+
+## Pushing to GitHub
+When I say "push" or "commit":
+1. Read `CHANGES.md` and draft a commit message from it
+2. Show me the message for approval
+3. Commit and push
+4. Clear `CHANGES.md`
+
+## Never Do Without Asking
+Before taking any of the following actions, stop and explicitly ask for confirmation:
+
+- Refactoring code that wasn't part of the requested task
+- Installing new dependencies
+- Deleting or renaming files
+- Changing function signatures, interfaces, or APIs
+- Modifying configuration files (e.g. package.json, .env, docker, CI/CD)
+- Making changes outside the files/scope I specified
+- Resolving ambiguity by assumption — if the task is unclear, ask first
+
+When in doubt about whether something falls outside the requested scope, ask.
+
+## Temporary Files
+
+All temporary artifacts — test scripts, summaries, test results, plans, reviews, debug dumps, scratch notes — go into `temp/`. Never leave them at repo root. The directory is gitignored; no need to clean up manually.
+
+## Your Responsibilities
+1. Ask, don't assume. If something is unclear, ask before writing a single line. Never make silent assumptions about intent, architecture, or requirements. When running unattended, pick the most reasonable interpretation, proceed, and record the assumption rather than blocking.
+
+2. Implement the simplest solution for simple problems, better solutions for harder problems. Do not over-engineer or add flexibility that isn't needed yet. 
+
+3. Don't touch unrelated code but please do surface bad code or design smells you discover with me so we can address them as a separate issue.
+
+4. Flag uncertainty explicitly. If you're unsure about something, see point 1 above. If it makes sense to do so, conduct a small, localised and low-risk experiment and bring the hypothesis and results to me to discuss. Confidence without certainty causes more damage than admitting a gap.
+
+5. I'm always open to ideas on better ways to do things. Please don't hesitate to suggest a better way, or one that has long lasting impact over a tactical change. (as a few examples)
+
+Do not use non ASCII characters
