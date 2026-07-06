@@ -174,33 +174,74 @@ st.sidebar.markdown(
 if "engine_process" not in st.session_state:
     st.session_state.engine_process = None
 
+
+def _launch_engine():
+    """Popen the engine as a detached child and return the process handle.
+
+    Shared by the Start button and the restart relaunch path. Raises on
+    failure — callers surface the error.
+    """
+    engine_script = str(_FADER_ROOT / "run_engine.py")
+    project_root = str(_FADER_ROOT.parent)
+    log_path = str(_FADER_ROOT / "engine_startup.log")
+    # Child inherits its own dup of the fd at spawn, so closing the parent's
+    # handle after Popen returns (context exit) is safe and avoids leaking a
+    # descriptor on every launch.
+    with open(log_path, "w") as log_f:
+        return subprocess.Popen(
+            [sys.executable, engine_script],
+            cwd=project_root,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+        )
+
+
 proc = st.session_state.engine_process
 if proc is not None and proc.poll() is not None:
-    # Process exited since last render
+    # Process exited since last render.
     st.session_state.engine_process = None
     proc = None
 
+# Cold-restart relaunch: engine confirmed down + a restart was requested and
+# the dashboard owns the process (local launch — no external supervisor). The
+# old process is still alive (poll() is None) during the ~5-15s graceful
+# shutdown, so this only fires once it has actually exited. On the VPS the
+# engine runs under systemd (flag never set), so this never fires. The flag is
+# cleared only on a successful launch, so a failed attempt retries next rerun.
+if st.session_state.get("pending_local_relaunch") and st.session_state.engine_process is None:
+    try:
+        st.session_state.engine_process = _launch_engine()
+        st.session_state.pending_local_relaunch = False
+        st.session_state.control_flash = "Engine cold-restarted"
+        proc = st.session_state.engine_process
+    except Exception as e:
+        st.sidebar.error(f"Relaunch failed (will retry): {e}")
+
 engine_running = _engine_is_running()
 proc_active = st.session_state.engine_process is not None
+
+# Local cold-restart driver: the dashboard has no external autorefresh, so
+# while a dashboard-owned engine is still shutting down (poll() is None) after
+# a restart, poll + rerun once a second so the exit gets detected and the
+# relaunch above fires. Bounded (~30s) to avoid an infinite loop if graceful
+# shutdown hangs — after that the user can Start manually.
+if st.session_state.get("pending_local_relaunch"):
+    _old = st.session_state.engine_process
+    _ticks = st.session_state.get("relaunch_wait_ticks", 0)
+    if _old is not None and _old.poll() is None and _ticks < 30:
+        st.session_state.relaunch_wait_ticks = _ticks + 1
+        time.sleep(1.0)
+        st.rerun()
+    else:
+        st.session_state.relaunch_wait_ticks = 0
 
 st.sidebar.divider()
 
 # Start / Stop controls
 if not engine_running and not proc_active:
     if st.sidebar.button("Start Engine", type="primary", width='stretch'):
-        engine_script = str(_FADER_ROOT / "run_engine.py")
-        project_root = str(_FADER_ROOT.parent)
-        log_path = str(_FADER_ROOT / "engine_startup.log")
-        cmd = [sys.executable, engine_script]
         try:
-            with open(log_path, "w") as log_f:
-                p = subprocess.Popen(
-                    cmd,
-                    cwd=project_root,
-                    stdout=log_f,
-                    stderr=subprocess.STDOUT,
-                )
-            st.session_state.engine_process = p
+            st.session_state.engine_process = _launch_engine()
             st.sidebar.success("Engine starting...")
             time.sleep(3)
             st.rerun()
@@ -227,6 +268,19 @@ else:
         st.session_state.confirm_close_all = False
         st.session_state.control_flash = "Close-all issued"
 
+    def _issue_restart() -> None:
+        # Engine shuts down gracefully (cancels resting orders) then exits 42.
+        # A supervisor cold-starts it: systemd on the VPS, or — for a dashboard-
+        # launched local engine — the pending_local_relaunch path above.
+        issue_command("restart")
+        st.session_state.confirm_restart = False
+        if st.session_state.get("engine_process") is not None:
+            st.session_state.pending_local_relaunch = True
+            st.session_state.relaunch_wait_ticks = 0
+        st.session_state.control_flash = (
+            "Kill + cold restart issued (engine back in ~5-15s)"
+        )
+
     flash = st.session_state.pop("control_flash", None)
     if flash:
         st.sidebar.success(flash)
@@ -245,6 +299,17 @@ else:
     st.sidebar.button("CLOSE ALL Positions", type="secondary",
                       disabled=not close_confirm, width='stretch',
                       on_click=_issue_close_all)
+
+    restart_confirm = st.sidebar.checkbox(
+        "Confirm KILL + COLD RESTART", key="confirm_restart"
+    )
+    st.sidebar.button(
+        "KILL + COLD RESTART Engine", type="secondary",
+        disabled=not restart_confirm, width='stretch', on_click=_issue_restart,
+        help="Graceful shutdown (cancels resting orders) then full process "
+             "cold start — reloads .env, re-runs telegram.configure + full "
+             "reconcile. Use after editing .env or for a clean slate.",
+    )
 
     if st.sidebar.button("Reload Config", width='stretch'):
         issue_command("config_reload")

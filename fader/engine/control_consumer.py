@@ -1,7 +1,7 @@
 """engine/control_consumer.py
 
 Polls control_commands table every control_poll_s.
-Applies: stop, start, close_all, breaker_reset, config_reload, slug_add, slug_remove.
+Applies: stop, start, restart, close_all, breaker_reset, config_reload, slug_add, slug_remove.
 Bounds emergency stop/close-all latency to ~1s.
 """
 
@@ -34,6 +34,7 @@ class ControlConsumer:
         self._cbs: Dict[str, Optional[Callable]] = {
             "stop": stop_engine_cb,
             "start": stop_engine_cb,  # same dispatcher; restarts strategy loop
+            "restart": stop_engine_cb,  # same dispatcher; graceful shutdown + exit 42
             "close_all": close_all_cb,
             "breaker_reset": breaker_reset_cb,
             "config_reload": config_reload_cb,
