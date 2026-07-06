@@ -1,13 +1,13 @@
 mode: paper  # paper | live
 
 strategy:
-  band_low: 0.80
+  band_low: 0.5
   band_high: 0.95
-  min_dte: 0
-  max_dte: 365
+  min_dte: 3
+  max_dte: 6
   min_time_in_band_s: 600
   order_notional_usd: 10.0
-  alpha: 0.0  # tilt ∈ [-1, +1]; 0=uniform, -1=low-price, +1=high-price
+  alpha: -0.20  # tilt ∈ [-1, +1]; 0=uniform, -1=low-price, +1=high-price
 
 filters:
   min_24h_volume: 1000.0

@@ -2,14 +2,16 @@
 crypto_sweep.py — Per-market 4D parameter sweep for crypto series.
 
 Sweeps band_low x alpha x (min_dte, max_dte) independently for each
-crypto market (BTC, ETH, SOL, XRP).
+crypto market (BTC, ETH, SOL).
 
 Uses multiprocessing (8 workers) for parallel backtest evaluation.
+Top-N configs per market are re-validated with walk-forward OOS
+(calendar-window stability, no parameter re-optimization) to flag overfitting.
 
 Outputs:
   - DATA/crypto_sweep/{slug_filter}_results.csv   (full grid)
   - DATA/crypto_sweep/{slug_filter}_top30.csv     (top 30 by composite score)
-  - DATA/crypto_sweep/summary.md                  (per-market best configs)
+  - DATA/crypto_sweep/summary.md                  (top 10 per market + walk-forward OOS)
 """
 
 from __future__ import annotations
@@ -41,8 +43,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 BAND_LOWS = [round(x, 2) for x in np.arange(0.50, 0.91, 0.05)]
 BAND_HIGH = 0.95
-ALPHAS = [round(x, 2) for x in np.arange(-0.20, 0.61, 0.05)]
-MIN_DTES = list(range(0, 7))   # 0..6
+ALPHAS = [round(x, 2) for x in np.arange(-0.50, 0.51, 0.05)]
+MIN_DTES = list(range(0, 8))   # 0..7
 MAX_DTES = list(range(1, 8))   # 1..7
 
 # Crypto markets to sweep (slug_filter -> display name)
@@ -52,6 +54,11 @@ CRYPTO_MARKETS = [
     ("solana-above", "SOL"),
     ("xrp-above", "XRP"),
 ]
+
+# Walk-forward OOS validation (top N configs per market get re-tested)
+WALKFORWARD_TOP_N = 3
+WALKFORWARD_WINDOWS = 4
+WALKFORWARD_BOOTSTRAP = 1000
 
 INITIAL_CAPITAL = 1000.0
 ORDER_NOTIONAL = 25.0
@@ -209,6 +216,64 @@ def _run_chunk(args):
 
 
 # ---------------------------------------------------------------------------
+# Walk-forward OOS validation (top-N configs per market)
+# ---------------------------------------------------------------------------
+
+def _run_walkforward_for_top_configs(
+    df_out: pd.DataFrame, market_df: pd.DataFrame, top_n: int
+) -> List[dict]:
+    """Re-test top_n configs (by score) across calendar windows.
+
+    No parameter is re-optimized on any window — same config applied to
+    every window. Returns per-config stability summaries for the report.
+    """
+    from backtest.engine import BacktestConfig
+    from backtest.walkforward import partition_calendar_windows, window_summary
+    from execution.sizing import make_sizing_fn
+
+    windows = partition_calendar_windows(market_df, n_windows=WALKFORWARD_WINDOWS)
+    out = []
+    for _, row in df_out.head(top_n).iterrows():
+        band_low = float(row["band_low"])
+        alpha = float(row["alpha"])
+        min_dte = int(row["min_dte"])
+        max_dte = int(row["max_dte"])
+
+        sizing_fn = make_sizing_fn(alpha, band_low, BAND_HIGH)
+        cfg = BacktestConfig(
+            band_low=band_low,
+            band_high=BAND_HIGH,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            min_time_in_band_days=MIN_TIME_IN_BAND_DAYS,
+            order_notional_usd=ORDER_NOTIONAL,
+            spread_c=SPREAD_C,
+            sizing_fn=sizing_fn,
+            n_bootstrap=WALKFORWARD_BOOTSTRAP,
+        )
+        try:
+            per_window, stability = window_summary(
+                windows, cfg,
+                n_bootstrap=WALKFORWARD_BOOTSTRAP,
+                initial_capital=INITIAL_CAPITAL,
+            )
+        except Exception as e:
+            logger.warning(f"walkforward failed for band_low={band_low} alpha={alpha}: {e}")
+            continue
+
+        out.append({
+            "band_low": band_low,
+            "alpha": alpha,
+            "min_dte": min_dte,
+            "max_dte": max_dte,
+            "is_score": row["score"],
+            "per_window": per_window,
+            "stability": stability,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -229,20 +294,37 @@ def save_results(results: List[dict], slug_filter: str, out_dir: str) -> pd.Data
     return df
 
 
-def write_summary(all_dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
-    """Write a markdown summary of best config per market."""
+def write_summary(
+    all_dfs: Dict[str, pd.DataFrame],
+    all_walkforward: Dict[str, List[dict]],
+    out_dir: str,
+) -> None:
+    """Write a markdown summary: top 10 per market + walk-forward OOS validation."""
     lines = [
         "# Crypto Market Parameter Sweep - Summary",
         "",
         f"**Bankroll**: \\${INITIAL_CAPITAL:,.0f}  ",
         f"**Notional**: \\${ORDER_NOTIONAL:,.0f} per trade  ",
-        f"**Band high**: {BAND_HIGH}  ",
+        f"**Band low sweep**: {BAND_LOWS[0]:.2f} - {BAND_LOWS[-1]:.2f} (step 0.05)  ",
+        f"**Band high**: {BAND_HIGH} (fixed)  ",
+        f"**Alpha sweep**: {ALPHAS[0]:.2f} - {ALPHAS[-1]:.2f} (step 0.05)  ",
+        f"**DTE sweep**: min {MIN_DTES[0]}-{MIN_DTES[-1]}, max {MAX_DTES[0]}-{MAX_DTES[-1]} (min < max only)  ",
         f"**Workers**: {N_WORKERS}  ",
         f"**Bootstrap**: {N_BOOTSTRAP}  ",
         "",
         "## Composite Score",
         "",
         "`score = Sortino + 0.5*Return%*100 + Calmar - 0.5*MaxDD%*100 - 0.2*(CVaR/|PnL|)*100`",
+        "",
+        "## Walk-Forward OOS Validation",
+        "",
+        f"Top {WALKFORWARD_TOP_N} configs per market (by score) are re-tested across "
+        f"{WALKFORWARD_WINDOWS} contiguous calendar windows with **no parameter "
+        "re-optimization** — the same config is applied to every window. This checks "
+        "whether performance is consistent over time or concentrated in one lucky "
+        "stretch (overfitting signal). `stability_grade` of `stable` or `moderate` "
+        "means the config held up; `unstable` means the grid-search result is likely "
+        "overfit to a specific period.",
         "",
         "---",
         "",
@@ -287,10 +369,10 @@ def write_summary(all_dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
         )
         lines.append("")
 
-        # Top 5 table
-        lines.append("### Top 5 configurations")
+        # Top 10 table
+        lines.append("### Top 10 configurations (sorted by risk-adjusted score)")
         lines.append("")
-        top5 = df.head(5)
+        top10 = df.head(10)
         header = (
             "| # | band_low | alpha | min_dte | max_dte | Score | PnL | Sortino | "
             "Calmar | MaxDD% | VaR95 | nTrades |"
@@ -300,7 +382,7 @@ def write_summary(all_dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
             "|---|----------|-------|---------|---------|-------|-----|---------|"
             "--------|--------|-------|---------|"
         )
-        for i, (_, r) in enumerate(top5.iterrows(), 1):
+        for i, (_, r) in enumerate(top10.iterrows(), 1):
             calmar_str = f"{r['calmar']:.2f}" if r["calmar"] else "-"
             lines.append(
                 f"| {i} | {r['band_low']:.2f} | {r['alpha']:.2f} | "
@@ -311,6 +393,60 @@ def write_summary(all_dfs: Dict[str, pd.DataFrame], out_dir: str) -> None:
                 f"\\${r['daily_var_95']:,.0f} | {int(r['n_trades'])} |"
             )
         lines.append("")
+
+        # Walk-forward OOS section
+        wf_list = all_walkforward.get(label, [])
+        if wf_list:
+            lines.append("### Walk-Forward OOS Validation (top configs)")
+            lines.append("")
+            lines.append(
+                "| Rank | band_low | alpha | DTE | Grade | Sortino CV | "
+                "Sortino min/max | PnL concentration | Windows w/ trades |"
+            )
+            lines.append(
+                "|------|----------|-------|-----|-------|------------|"
+                "-----------------|--------------------|--------------------|"
+            )
+            for i, wf in enumerate(wf_list, 1):
+                st = wf["stability"]
+                sortino_cv = f"{st['sortino_cv']:.2f}" if st.get("sortino_cv") is not None else "N/A"
+                sortino_rng = (
+                    f"{st['sortino_min']:.2f} / {st['sortino_max']:.2f}"
+                    if st.get("sortino_min") is not None else "N/A"
+                )
+                pnl_conc = f"{st['pnl_concentration']*100:.0f}%" if st.get("pnl_concentration") is not None else "N/A"
+                lines.append(
+                    f"| {i} | {wf['band_low']:.2f} | {wf['alpha']:.2f} | "
+                    f"[{wf['min_dte']},{wf['max_dte']}] | {st['stability_grade']} | "
+                    f"{sortino_cv} | {sortino_rng} | {pnl_conc} | "
+                    f"{st['n_nonempty']}/{st['n_windows']} |"
+                )
+            lines.append("")
+
+            # Per-window detail for rank #1
+            top1 = wf_list[0]
+            lines.append(
+                f"**Per-window detail, rank 1** (band_low={top1['band_low']:.2f}, "
+                f"alpha={top1['alpha']:.2f}, DTE=[{top1['min_dte']},{top1['max_dte']}]):"
+            )
+            lines.append("")
+            lines.append("| Window | N Trades | Sortino | Calmar | Total PnL |")
+            lines.append("|--------|----------|---------|--------|-----------|")
+            for w in top1["per_window"]:
+                if w.n_trades == 0:
+                    lines.append(f"| {w.label} | 0 | - | - | - |")
+                    continue
+                m = w.metrics
+                calmar_str = f"{m['calmar']:.2f}" if m.get("calmar") else "-"
+                lines.append(
+                    f"| {w.label} | {w.n_trades} | {m.get('sortino', 0):.2f} | "
+                    f"{calmar_str} | \\${m.get('total_pnl', 0):,.2f} |"
+                )
+            lines.append("")
+        else:
+            lines.append("*Walk-forward validation unavailable (no results).*")
+            lines.append("")
+
         lines.append("---")
         lines.append("")
 
@@ -360,6 +496,7 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     all_dfs: Dict[str, pd.DataFrame] = {}
+    all_walkforward: Dict[str, List[dict]] = {}
     t_start = time.perf_counter()
 
     for slug_filter, label in CRYPTO_MARKETS:
@@ -418,10 +555,14 @@ def main() -> None:
         df_out = save_results(results, slug_filter, out_dir)
         all_dfs[label] = df_out
 
+        print(f"  Running walk-forward OOS validation on top {WALKFORWARD_TOP_N} configs...")
+        wf_results = _run_walkforward_for_top_configs(df_out, market_df, WALKFORWARD_TOP_N)
+        all_walkforward[label] = wf_results
+
         elapsed_mkt = time.perf_counter() - t_mkt
         print(f"  {label} done in {elapsed_mkt / 60:.1f}m  ({len(results)} configs with trades)")
 
-    write_summary(all_dfs, out_dir)
+    write_summary(all_dfs, all_walkforward, out_dir)
 
     elapsed_total = time.perf_counter() - t_start
     print(f"\n{'=' * 60}")
