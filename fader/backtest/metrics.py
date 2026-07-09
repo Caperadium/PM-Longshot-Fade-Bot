@@ -19,6 +19,59 @@ from scipy import stats as sp_stats
 PERIODS_PER_YEAR = 365
 METRICS_VERSION = 5  # v5: removed Sharpe (misleading for neg-skew strategies), promoted Sortino + Calmar; v4: +block bootstrap, tail metrics
 
+# Known backtest-vs-live filter gaps: historical Polymarket data cannot
+# reconstruct these three live-engine filters (Phase 4, strategy/filters.py
+# skipped-filter union). Keyed by the same filter-name strings the shared
+# filter core (strategy/filters.py) records in FilterResult.skipped /
+# EntrySnapshot None-fields, so callers can pass exactly what the backtest
+# engine actually skipped instead of relying on this fixed assumption.
+_UNIVERSE_DISCREPANCY_DEFS: Dict[str, Dict] = {
+    "min_24h_volume": {
+        "filter": "min_24h_volume",
+        "applied_in_live": True,
+        "applied_in_backtest": False,
+        "reason": (
+            "Polymarket Gamma /markets returns current volume24hr only "
+            "— no historical volume time series. Using cumulative "
+            "volume would introduce look-ahead bias (a market that "
+            "traded heavily post-entry would appear liquid at entry)."
+        ),
+        "bias_direction": "optimistic (wider universe, same fill model)",
+    },
+    "min_total_volume": {
+        "filter": "min_total_volume",
+        "applied_in_live": True,
+        "applied_in_backtest": False,
+        "reason": "Same as min_24h_volume — cumulative volumeNum is current-value only.",
+        "bias_direction": "optimistic (wider universe, same fill model)",
+    },
+    "min_book_depth": {
+        "filter": "min_book_depth",
+        "applied_in_live": True,
+        "applied_in_backtest": False,
+        "reason": "Historical order-book snapshots are not available from CLOB.",
+        "bias_direction": "optimistic (may include thin-book markets)",
+    },
+}
+# Historical default (pre-Phase-4): always exactly these three, regardless
+# of what any given run actually skipped. Preserved as the fallback when
+# compute_all_metrics() is called without an explicit skipped_filters
+# argument, so existing callers/goldens are byte-identical.
+_DEFAULT_UNIVERSE_DISCREPANCY_KEYS: Tuple[str, ...] = (
+    "min_24h_volume", "min_total_volume", "min_book_depth",
+)
+
+
+def _build_universe_discrepancies(skipped_filters: Optional[Tuple[str, ...]]) -> List[Dict]:
+    """Build the universe_discrepancies list. `skipped_filters=None` (the
+    default) reproduces the historical fixed 3-item list byte-for-byte.
+    When provided (e.g. by backtest/engine.py's run metadata), only
+    filters BOTH known to this table AND actually skipped in that run are
+    listed — unknown skipped-filter names (e.g. "dte", "stale_data", which
+    are not documented universe discrepancies) are silently ignored."""
+    keys = _DEFAULT_UNIVERSE_DISCREPANCY_KEYS if skipped_filters is None else skipped_filters
+    return [_UNIVERSE_DISCREPANCY_DEFS[k] for k in keys if k in _UNIVERSE_DISCREPANCY_DEFS]
+
 
 
 
@@ -219,6 +272,7 @@ def compute_all_metrics(
     trades: pd.DataFrame,
     n_bootstrap: int = 10000,
     initial_capital: float = 500.0,
+    skipped_filters: Optional[Tuple[str, ...]] = None,
 ) -> Dict:
     """
     Compute full metric suite from a trades DataFrame.
@@ -237,13 +291,21 @@ def compute_all_metrics(
     strategies like the NO-fader where gains are frequent but small and
     losses are rare but large.  Sortino and Calmar replace it.
 
+    ``skipped_filters``: optional iterable of filter-name strings that were
+    NOT evaluated in the run that produced ``trades`` (Phase 4:
+    strategy/filters.py's FilterResult.skipped union, surfaced by
+    backtest/engine.py's run metadata). When omitted (None, the default),
+    the historical fixed 3-item universe_discrepancies list is returned
+    unchanged. When provided, only the subset that is both a known
+    live-vs-backtest gap and actually skipped is listed.
+
     Returns a dict with:
       total_pnl, hit_rate, avg_win, avg_loss, expectancy,
       sortino, calmar, max_drawdown, max_drawdown_pct, daily_skew,
       daily_kurtosis, daily_var_95, daily_var_99, daily_cvar_95,
       daily_normality_p, n_daily, n_active_days,
       per_market, pnl_ci_95,
-      initial_capital, metrics_version, elapsed_ms
+      initial_capital, metrics_version, elapsed_ms, universe_discrepancies
     """
     if trades.empty or "realized_pnl" not in trades.columns:
         return {}
@@ -351,32 +413,5 @@ def compute_all_metrics(
         "initial_capital": capital,
         "metrics_version": METRICS_VERSION,
         "elapsed_ms": elapsed_ms,
-        "universe_discrepancies": [
-            {
-                "filter": "min_24h_volume",
-                "applied_in_live": True,
-                "applied_in_backtest": False,
-                "reason": (
-                    "Polymarket Gamma /markets returns current volume24hr only "
-                    "— no historical volume time series. Using cumulative "
-                    "volume would introduce look-ahead bias (a market that "
-                    "traded heavily post-entry would appear liquid at entry)."
-                ),
-                "bias_direction": "optimistic (wider universe, same fill model)",
-            },
-            {
-                "filter": "min_total_volume",
-                "applied_in_live": True,
-                "applied_in_backtest": False,
-                "reason": "Same as min_24h_volume — cumulative volumeNum is current-value only.",
-                "bias_direction": "optimistic (wider universe, same fill model)",
-            },
-            {
-                "filter": "min_book_depth",
-                "applied_in_live": True,
-                "applied_in_backtest": False,
-                "reason": "Historical order-book snapshots are not available from CLOB.",
-                "bias_direction": "optimistic (may include thin-book markets)",
-            },
-        ],
+        "universe_discrepancies": _build_universe_discrepancies(skipped_filters),
     }

@@ -48,14 +48,16 @@ Requires `.env` with `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_USER_ADDRESS`, and op
 **Two-process design** — engine (asyncio event loop) and dashboard (Streamlit), communicating through a shared SQLite WAL database. Both read/write the same `fader/fader.db`.
 
 ### Engine startup sequence (engine/main.py)
-1. Load config (config.yaml + slugs.csv)
-2. Init DB tables
-3. Resolve NO token IDs via Gamma API
+Object construction is a composition root (`engine/build.py`'s `build_engine(cfg) -> Engine`): Db/repos -> limiter/executor -> provider -> risk -> order_manager -> strategy_loop -> reconciler -> pollers/state_publisher/ws, all wired via constructor injection (no late setters). `engine/main.py` itself only does:
+1. Load config (config.yaml + slugs.csv) + init DB
+2. `build_engine(cfg)` — construct every long-lived object
+3. Resolve NO token IDs via Gamma API (`engine/startup.py`'s `resolve_markets`), populate the shared `MarketRegistry` (`engine/registry.py`) the composition root already wired into `ws_client`/`pollers`/`strategy_loop`
 4. Startup safety checks (USDC allowance; MATIC gate removed — CLOB orders are off-chain signed messages, no gas needed)
 5. Full API reconciliation (bankroll, orders, positions)
 6. Open CLOB websocket with exponential backoff
 7. Wait for initial order books (REST resync on connect)
-8. Launch concurrent tasks: strategy loop, order manager, pollers, state publisher, control consumer
+8. Rehydrate resting orders (unverified against a `None` API response are kept and re-verified every requote tick, not dropped; a DB read failure here fires a telegram alert and aborts startup), wire bankroll source (+ `bankroll_view` for staleness logging), pre-warm volume cache (`engine/startup.py`)
+9. Launch concurrent tasks: strategy loop, order manager, pollers, state publisher, control consumer (control-command dispatch + background config-watch/requote loops live in `engine/control.py`)
 
 ### Runtime tasks (all concurrent asyncio)
 | Task | Interval | Role |
@@ -68,7 +70,7 @@ Requires `.env` with `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_USER_ADDRESS`, and op
 | Control consumer | 1s | Process dashboard commands (stop, close_all, etc.) |
 | Config watcher | 5s | Hot-reload config.yaml + slugs.csv on file change |
 
-### 11-filter entry stack (engine/strategy_loop.py)
+### 11-filter entry stack (fader/strategy/filters.py + engine/strategy_loop.py)
 1. NO best ask ∈ [band_low, band_high]
 2. DTE ∈ [min_dte, max_dte]
 3. Continuously in band ≥ min_time_in_band_s (websocket timestamps)
@@ -81,11 +83,64 @@ Requires `.env` with `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_USER_ADDRESS`, and op
 10. Total deployed cap not breached
 11. Daily-loss circuit breaker not tripped
 
+Filters 1-8 are pure functions in `fader/strategy/filters.py`, shared by
+the live engine and the backtest engine (Phase 4 of the architecture
+refactor) -- one implementation instead of two independently-drifting
+copies. Filters 9-11 (stateful: bankroll, cumulative deployed notional,
+daily PnL) stay in `engine/risk.py`/`engine/strategy_loop.py`.
+
+**Pregate/entry split** (`strategy/filters.py`): `evaluate_pregate(best_ask,
+dte, params)` checks filters 1-2 only (cheap, no volumes/depth/staleness
+inputs needed); `evaluate_entry(snapshot, params)` runs the full filters
+1-8 stack against a fully-populated `EntrySnapshot`, calling
+`evaluate_pregate` internally first. `engine/strategy_loop.py` calls
+`evaluate_pregate` first and only fetches volumes (REST, 300s cache) to
+build the full `EntrySnapshot` after it passes -- building a full snapshot
+for every active market on every tick would be an API storm on every
+cache expiry. The series-expanded slug loop keeps its pre-existing
+asymmetry: it silently `continue`s on a pregate reject with no
+`log_rejected` call (thousands of series markets/tick would flood the
+decisions table), while the main slugs.csv loop logs every reject via
+`log_rejected(slug, token_id, result.reason, result.detail)`.
+
+**Per-field None semantics** (`FilterParams`/`EntrySnapshot`, normative --
+no generic "None means pass" rule exists): `best_ask=None` always rejects
+`no_book` in both engines. `dte=None` rejects `dte_out_of_range`
+(fail-closed) when `missing_dte="reject"` (live); is skipped
+(fail-open, matches today's backtest divergence) when `missing_dte="skip"`
+(backtest). `volume_24h`/`volume_total`/`ask_depth_usd`/`is_stale = None`
+each independently mark that filter as skipped (recorded in
+`FilterResult.skipped`) rather than reject or silently pass.
+
+**Paper-mode carve-outs** (both expressed as `FilterParams` flags, set
+False only in paper mode): `check_staleness` (thinly-traded longshot-tail
+markets get no WS deltas and go stale fast) and `check_time_in_band`
+(those same markets rarely accrue enough continuous in-band WS time) --
+two separate bypasses, both must be True for live's full gate.
+
+**Backtest mapping** (`backtest/engine.py`): builds an `EntrySnapshot` per
+row with `volume_24h`/`volume_total`/`ask_depth_usd`/`is_stale` always
+`None` (not reconstructable from historical Polymarket data) and
+`missing_dte="skip"`. `seconds_in_band = days_in_band * 86400` and
+`min_time_in_band_s = max(1, min_time_in_band_days) * 86400` are
+algebraically identical to the old day-count comparison; the stateful
+`days_in_band` counter reset/increment ordering and the `price <= 0`
+counter-reset-and-skip stay in the day loop as procedural code -- only the
+actual band/DTE/time-in-band comparisons were centralized into the shared
+core. `run_backtest()` attaches `trades_df.attrs["skipped_filters"]`
+(always the 3 volume/depth filter names) to the returned DataFrame without
+changing its `(trades_df, equity_df)` 2-tuple return shape.
+`backtest/metrics.py`'s `compute_all_metrics(..., skipped_filters=...)`
+reads this to build `universe_discrepancies` dynamically; omitting the
+argument (every pre-Phase-4 caller) reproduces the historical fixed
+3-item list unchanged.
+
 ### Order placement (execution/order_manager.py)
 - Spread ≤ 1c → market order (FOK)
 - Spread > 1c → limit at mid, requote on 0.5c mid move, TTL 5min, cancel on band exit
 - All orders carry deterministic idempotency keys (execution/idempotency.py)
 - Position row inserted immediately on market fill (closes 60s reconciler gap)
+- `provider.place_order()` returns a typed `OrderResult` (`FILLED|PENDING|REJECTED|DUPLICATE|UNKNOWN`); `_place_market`/`_place_limit` dispatch on `result.status` — the same code path handles paper (instant `FILLED`) and live (`PENDING`/`REJECTED`) placement, no more `provider.is_paper` branching inside the placement methods. `DUPLICATE` (keyed by the `is_duplicate_error` signal, from either a CLOB success=false body or an exception string) runs `find_order_by_params` recovery via `_handle_duplicate`, falling back to `UNKNOWN` (no position insert) if recovery fails.
 
 ### Alpha tilt (execution/sizing.py)
 Parameter `alpha` ∈ [-1, +1] redistributes notional across price band. +1 heavier on high-prob (near 0.95), -1 heavier on low-prob (near band_low), 0 = uniform. Floor at $1.00.
@@ -121,40 +176,48 @@ Current series:
 
 | Module | Role |
 |---|---|
-| `config/config_loader.py` | AppConfig, load_config, config hot-reload (5s mtime poll) |
-| `execution/provider.py` | Polymarket REST wrapper (paper + live), MarketInfo, CLOB client |
-| `execution/order_manager.py` | Order placement, market/limit dispatch, requote loop, TTL |
+| `config/config_loader.py` | AppConfig, load_config, config hot-reload (5s mtime poll). `DEFAULT_WS_URL` is the single authoritative default for the CLOB market-data websocket URL (`FeedConfig.ws_url` and `marketdata/ws_client.py`'s constructor default both reference it). `apply_config_kv_overrides(cfg)` returns the list of YAML keys currently shadowed by a `config_kv` row; `ConfigWatcher.check_and_reload` logs that list and publishes it to `engine_state` as `active_overrides` (rendered in the dashboard sidebar) |
+| `strategy/filters.py` | Pure, I/O-free shared filter core (Phase 4): `FilterParams`, `EntrySnapshot`, `FilterResult`, `evaluate_pregate` (filters 1-2), `evaluate_entry` (filters 1-8). Used by both `engine/strategy_loop.py` (live) and `backtest/engine.py` (backtest) — one implementation instead of two |
+| `execution/provider.py` | `BaseProvider`/`LiveProvider`/`PaperProvider` split, `OrderResult` dataclass, `MarketInfo`, CLOB client, `make_provider(cfg,...)` factory, `Provider(...)` compatibility alias, `is_paper` property |
+| `execution/order_manager.py` | Order placement, market/limit dispatch on `OrderResult.status`, `_handle_duplicate` recovery, requote loop, TTL |
 | `execution/sizing.py` | Alpha tilt notional sizing, band redistribution, $1.00 floor |
 | `execution/idempotency.py` | Deterministic idempotency keys for all orders |
-| `marketdata/ws_client.py` | Persistent CLOB websocket, reconnect, delta/snapshot handling, REST resync |
+| `marketdata/ws_client.py` | Persistent CLOB websocket, reconnect, delta/snapshot handling, REST resync. `_handle_message` dispatches per event-type via a `self._dispatch` dict (built once in `__init__` from `_on_book`/`_on_price_change`/etc.) instead of an if/elif chain; `_sync_book(token_id)` is the shared staleness-touch + band-tracker-update tail for the book/price_change handlers. Constructor's `ws_url` default is `config.config_loader.DEFAULT_WS_URL` (no more local `WS_URL` constant) |
 | `marketdata/book_state.py` | In-memory OrderBook per contract, band-entry timing tracker |
 | `marketdata/staleness.py` | Per-contract staleness + feed-wide gap-halt |
-| `marketdata/rest_market.py` | REST endpoints: DTE, volumes, series market discovery |
-| `engine/risk.py` | Circuit breaker, max deployed, per-market caps |
-| `engine/reconciler.py` | Startup + periodic API reconciliation (bankroll, orders, positions) |
+| `marketdata/rest_market.py` | REST endpoints: DTE, volumes, series market discovery. `parse_market_outcomes(raw) -> dict` (+ `OUTCOME_NO` constant) centralizes Gamma `clobTokenIds`/`outcomes` parsing and NO-outcome lookup, used by `discover_new_rungs`, `discover_series_markets`, and `execution.provider.LiveProvider.resolve_no_token` |
+| `engine/build.py` | Composition root: `build_engine(cfg) -> Engine` dataclass, constructor-injects provider/risk/order_manager/strategy_loop/reconciler/pollers/state_publisher/ws_client |
+| `engine/startup.py` | Startup-sequence helpers: token resolution (binary + series expansion), volume cache pre-warm |
+| `engine/control.py` | Control-command dispatch (`make_on_command`) + background config-watch/requote loops; needs process-lifecycle state (`ConfigWatcher`, `stop_event`) so it stays outside `build.py` |
+| `engine/registry.py` | `MarketRegistry`: single owner of `{slug: MarketInfo}` (replaces the former shared `token_map` dict). `get`/`add`/`mark_resolved`/`active_items` (snapshot copy)/`slugs`; no `await` inside any method. Shared by `strategy_loop`, `pollers`, the ws `market_resolved` callback, and `main.py`/`build.py` |
+| `engine/risk.py` | Circuit breaker, max deployed, per-market caps. `breaker_tripped` is a property that reads through `BreakerRepo.day_state(today_utc())`, memoized <=1s — no in-memory trip flag, so a trip survives a `RiskManager` restart and a new UTC day simply has no DB row (no explicit rollover step) |
+| `engine/reconciler.py` | Startup + periodic API reconciliation (bankroll, orders, positions); skips the order-reconcile cycle when `fetch_open_orders()` returns `None` (API error) instead of mass-marking orders UNKNOWN. `bankroll` stays a plain `float` (five consumers depend on the exact type); `bankroll_view` is a separate `BankrollView(value, as_of)` property used only for staleness logging. Tracks consecutive reconcile failures on two separate counters: `reconcile_failures` (positions/paper-resolutions) and `order_reconcile_failures` (order-reconcile `None`-skip path); both published to `engine_state` and fire `infra.telegram.alert_reconcile_failures` (`>=` threshold of 5, refires every cycle at/above it) after 5 in a row, reset on the next success. The stale-UNKNOWN-to-CANCELLED order reaper (in `_reconcile_orders`) commits via `OrdersRepo.reap_stale_unknown()` with no shared conn — a pre-existing no-commit bug fixed in Phase 6 — and now compares a Python-computed ISO cutoff against `created_at` directly (was a raw-string comparison against SQLite's differently-formatted `datetime()` output, which made the effective TTL ~1 day instead of the intended 1 hour; fixed alongside the escalation-counter split above) |
 | `engine/control_consumer.py` | Dashboard-to-engine IPC via control_commands table |
-| `engine/pollers.py` | Bankroll (30s), resolution (60s), discovery (300s) background tasks |
+| `engine/pollers.py` | Bankroll (30s), resolution (60s), discovery (300s) background tasks; discovery mutates the shared `MarketRegistry` (`engine/registry.py`) instead of a bare dict |
 | `engine/state_publisher.py` | Engine → DB state publishing (2s interval) |
-| `infra/db.py` | SQLite WAL schema, all 10 tables + 11 indexes |
+| `infra/db.py` | SQLite WAL schema, all 10 tables + 11 indexes; low-level `get_connection`/`execute_write` primitives that `persistence/repos.py` builds on |
 | `infra/telegram.py` | Telegram alerts (heartbeat, breaker trips, errors) |
 | `infra/rate_limiter.py` | Token-bucket rate limiter for API calls |
 | `infra/logging_setup.py` | Structured logging configuration |
-| `persistence/decision_log.py` | Per-decision log persistence to decisions table |
+| `persistence/repos.py` | Typed repository layer (`Db`, `PositionsRepo`, `OrdersRepo`, `BreakerRepo`, `DecisionsRepo`, `ControlRepo`, `EngineStateRepo`, `ConfigKVRepo`) — all engine-side SQL lives here. Module-level default instances (`positions_repo`, `orders_repo`, etc.) are used directly by engine code this phase; `Db.transaction()` gives atomic multi-statement writes (e.g. order-fill bookkeeping). Every method takes an optional `conn`: passed-in conn -> caller owns commit/close; `None` -> repo opens/commits/closes per call. |
+| `persistence/decision_log.py` | Per-decision log persistence to decisions table; delegates to `DecisionsRepo`. `log_decision`/`log_entered`/`log_rejected` return `bool` (success/failure of the write) |
 | `dashboard/app.py` | 8-tab Streamlit dashboard |
 | `dashboard/backtest_page.py` | Backtest UI (embedded + standalone) with parameter sweep |
-| `backtest/engine.py` | Backtest engine with filter reapplication |
+| `backtest/engine.py` | Backtest engine; filters 1-8 delegate to `strategy/filters.py` (Phase 4) with `missing_dte="skip"` (fail-open DTE) and volumes/depth/staleness always `None` (not reconstructable historically) — `run_backtest()` attaches the always-skipped filter names to `trades_df.attrs["skipped_filters"]`. Sizing delegates to `execution.sizing.compute_shares_and_notional` (Phase 5; local `_compute_size` deleted) — only the share-count element is used, `BacktestTrade.notional` stays the stake |
 | `backtest/historical.py` | Historical price fetching, ContractPriceStore, generic daily series discovery |
-| `backtest/metrics.py` | Sortino, Calmar, max DD, VaR/CVaR, block bootstrap CIs |
+| `backtest/metrics.py` | Sortino, Calmar, max DD, VaR/CVaR, block bootstrap CIs; `compute_all_metrics(..., skipped_filters=...)` builds `universe_discrepancies` from the actual skipped-filter set when provided, else the historical fixed 3-item list |
 | `backtest/walkforward.py` | Walk-forward stability (calendar window partitioning) |
-| `backtest/band_sweep.py` | Sweep lower band bound across allocation tilts |
-| `backtest/allocation_analysis.py` | Full α-sweep: monotonicity, concavity, paired CIs |
-| `backtest/grid_sweep.py` | Grid sweep backtest for parameter search |
-| `backtest/is_oos_backtest.py` | IS/OOS (in-sample / out-of-sample) backtest validation |
-| `backtest/crypto_sweep.py` | Per-market grid sweep (band_low x alpha x DTE) for BTC/ETH/SOL/XRP + walk-forward OOS validation of top configs |
+| `backtest/harness.py` | Shared backtest harness (Phase 5): `HarnessDefaults` dataclass (defaults CLIs override via `dataclasses.replace()` when they diverge, e.g. `crypto_sweep.CRYPTO_DEFAULTS`); `load_store()`; `run_config()` (`run_backtest` + `compute_all_metrics` + flat `MetricsRow` extraction); `run_grid()` (spawn-safe multiprocessing — module-level worker fn, `df_json` passed inside each worker's args, no pool initializer). Also holds all THREE walk-forward variants as separate functions — `walkforward_normalized` (= former `allocation_analysis.walkforward_validate`, globally-normalized sizing), `walkforward_lean` (= former `grid_sweep._oos_validate`, unnormalized sizing + per-band baseline cache), `window_stability` (= former `crypto_sweep._run_walkforward_for_top_configs`, same fixed config re-tested per window, no baseline comparison) — kept distinct because their sizing/comparison math differs; do not merge them |
+| `backtest/report.py` | Shared report-formatting pieces (Phase 5): `metrics_table` (column-aligned text table from row dicts), `caveats_section` (renders the known backtest-vs-live filter gaps, reading a run's `skipped_filters` when available), `write_report` (compose sections, mkdir + write to a path). The five CLIs' own report bodies are otherwise unchanged — content-identical, not byte-identical, is the bar |
+| `backtest/band_sweep.py` | Sweep lower band bound across allocation tilts; loads data via `harness.load_store()`, runs configs via `harness.run_config()`, writes reports via `report.write_report()` — no per-CLI divergence from `HarnessDefaults` |
+| `backtest/allocation_analysis.py` | Full α-sweep: monotonicity, concavity, paired CIs. `walkforward_validate` is now a thin delegate to `harness.walkforward_normalized`; its analysis-only helpers (`_run_scheme`, `_make_sized_fn`, `compute_normalization_factor`, `extract_entry_prices`) stay here and are imported back into `harness.py` (deferred, to avoid a circular import) |
+| `backtest/grid_sweep.py` | Grid sweep backtest for parameter search. `_run_lean`/`_metrics_row`/`BandCache`/`_build_band_cache`/`_oos_validate` are now thin wrappers around `harness.build_band_cache`/`harness.walkforward_lean` with this CLI's original defaults ($10 notional, 1-day min-time-in-band, 1c spread) preserved |
+| `backtest/is_oos_backtest.py` | IS/OOS (in-sample / out-of-sample) backtest validation; `_run_candidate` calls `harness.run_config()` instead of duplicating `run_backtest` + `compute_all_metrics` |
+| `backtest/crypto_sweep.py` | Per-market grid sweep (band_low x alpha x DTE) for BTC/ETH/SOL/XRP + walk-forward OOS validation of top configs. Declares `CRYPTO_DEFAULTS = replace(HarnessDefaults(), order_notional_usd=25.0)` at the top (the $25-vs-$10 divergence from the shared default is named and greppable). `_run_chunk`'s multiprocessing pattern (module-level worker fn, `df_json` serialized inside each worker's args tuple) is the reference `harness.run_grid()` copies. `_run_walkforward_for_top_configs` is a thin wrapper around `harness.window_stability` |
 
 ## Config
 
-Single YAML file at `fader/config/config.yaml`. Hot-reloaded by ConfigWatcher (5s poll of file mtime). Dashboard can also write live overrides to `config_kv` table. Slugs registry in `fader/config/slugs.csv`.
+Single YAML file at `fader/config/config.yaml`. Hot-reloaded by ConfigWatcher (5s poll of file mtime). Dashboard can also write live overrides to `config_kv` table. Slugs registry in `fader/config/slugs.csv`. Every hot-reload logs which YAML keys are currently shadowed by a `config_kv` row and publishes them to `engine_state` as `active_overrides`; the dashboard sidebar shows a caption listing any active overrides so a config.yaml edit that appears to have no effect is easy to diagnose.
 
 ### slugs.csv columns
 

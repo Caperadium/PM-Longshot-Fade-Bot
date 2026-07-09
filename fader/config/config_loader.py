@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path(__file__).resolve().parent
 
+# Single authoritative default for the CLOB market-data websocket URL
+# (Phase 6, item 2). config.yaml's feed.ws_url is the user-facing override;
+# ws_client.py no longer keeps its own module-level copy of this default.
+DEFAULT_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
 COLD_PARAMS = frozenset({
     "feed.ws_url",
     "auth.mode",
@@ -54,7 +59,7 @@ class FeedConfig:
     decision_interval_s: float = 1.0
     max_staleness_seconds: int = 30
     gap_halt_seconds: int = 60
-    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    ws_url: str = DEFAULT_WS_URL
     ws_force_reconnect_s: int = 90   # force WS reconnect if no feed data this long
     ws_ping_interval_s: int = 10     # app-level PING cadence
     ws_pong_timeout_s: int = 25      # close socket if no PONG within this (1a only)
@@ -282,7 +287,17 @@ class ConfigWatcher:
         try:
             new = load_config(self._cp, self._sp)
             self._apply_hot(new)
-            apply_config_kv_overrides(self._cfg)  # KV overlay always wins over yaml
+            # KV overlay always wins over yaml. Phase 6, item 6: surface
+            # which YAML keys are currently shadowed by a config_kv row --
+            # otherwise a stale dashboard override silently masks an
+            # intentional config.yaml edit with no visible trace.
+            shadowed = apply_config_kv_overrides(self._cfg)
+            if shadowed:
+                logger.info(
+                    f"Config hot-reload: {len(shadowed)} key(s) shadowed by "
+                    f"config_kv overrides: {', '.join(sorted(shadowed))}"
+                )
+            _publish_active_overrides(shadowed)
             self._last_mtime_cfg = cfg_mtime
             self._last_mtime_slugs = slugs_mtime
             logger.info("Config hot-reloaded")
@@ -367,30 +382,29 @@ _KV_MAP: Dict[str, str] = {
 }
 
 
-def apply_config_kv_overrides(cfg: AppConfig) -> None:
+def apply_config_kv_overrides(cfg: AppConfig) -> List[str]:
     """Read config_kv table and overlay dashboard-written overrides onto cfg.
 
     Safe to call at startup (after load_config) and on every config_reload.
     Only applies keys that exist in _KV_MAP; ignores unknown keys silently.
+
+    Returns the list of keys actually applied (i.e. the YAML keys currently
+    shadowed by a config_kv row) -- Phase 6, item 6: ConfigWatcher.check_and_
+    reload logs and publishes this list as engine_state's active_overrides
+    so it's visible on the dashboard, not just inferable from config_kv
+    directly. Existing callers (engine/main.py, engine/control.py) ignore
+    the return value -- this is an additive signature change.
     """
     import json
 
+    applied: List[str] = []
     try:
-        from infra.db import get_connection
+        from persistence.repos import config_kv_repo
 
-        conn = get_connection()
-        try:
-            rows = conn.execute(
-                "SELECT key, value FROM config_kv WHERE key IN ({})".format(
-                    ",".join("?" for _ in _KV_MAP)
-                ),
-                list(_KV_MAP.keys()),
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = config_kv_repo.get_keys(list(_KV_MAP.keys()))
 
         if not rows:
-            return
+            return applied
 
         for row in rows:
             key = row["key"]
@@ -400,11 +414,25 @@ def apply_config_kv_overrides(cfg: AppConfig) -> None:
             try:
                 raw = json.loads(row["value"])
                 _set_config_attr(cfg, attr_path, raw)
+                applied.append(key)
             except (json.JSONDecodeError, TypeError, ValueError) as e:
                 logger.warning(f"config_kv override '{key}' invalid: {e}")
 
     except Exception as e:
         logger.warning(f"Failed to apply config_kv overrides: {e}")
+
+    return applied
+
+
+def _publish_active_overrides(shadowed: List[str]) -> None:
+    """Publish the list of config_kv-shadowed YAML keys to engine_state
+    (Phase 6, item 6) so the dashboard sidebar can render them. Best-effort
+    -- a publish failure must not take down the config watch loop."""
+    try:
+        from persistence.repos import engine_state_repo
+        engine_state_repo.publish("active_overrides", shadowed)
+    except Exception as e:
+        logger.warning(f"Failed to publish active_overrides: {e}")
 
 
 def _set_config_attr(cfg: AppConfig, attr_path: str, value: Any) -> None:

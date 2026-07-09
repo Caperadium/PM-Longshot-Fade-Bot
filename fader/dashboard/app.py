@@ -32,6 +32,7 @@ if str(_FADER_ROOT) not in sys.path:
 
 from infra.db import get_connection, init_db
 from engine.control_consumer import issue_command
+from persistence.repos import config_kv_repo, positions_repo
 from dashboard import backtest_page
 
 st.set_page_config(
@@ -74,30 +75,12 @@ def _scalar(sql: str, params: tuple = (), default=0):
 
 
 def _write_config_kv(key: str, value: Any) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO config_kv (key, value, updated_at) VALUES (?, ?, ?)",
-            (key, json.dumps(value), now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    config_kv_repo.set(key, value)
 
 
 def _get_config_kv(key: str, default: Any = None) -> Any:
     """Read config_kv override; fall back to default if no entry exists."""
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT value FROM config_kv WHERE key=?", (key,)
-        ).fetchone()
-        if row:
-            return json.loads(row["value"])
-    finally:
-        conn.close()
-    return default
+    return config_kv_repo.get(key, default)
 
 
 def _engine_is_running() -> bool:
@@ -169,6 +152,16 @@ st.sidebar.markdown(
     **Last update:** {published_at}
     """
 )
+
+# Config override visibility (Phase 6, item 6): YAML keys currently
+# shadowed by a config_kv row, published by ConfigWatcher on every
+# hot-reload. Lets an operator see at a glance why a config.yaml edit
+# might not be taking effect.
+active_overrides = _get_state("active_overrides") or []
+if active_overrides:
+    st.sidebar.caption(
+        f"Overriding config.yaml: {', '.join(sorted(active_overrides))}"
+    )
 
 # Session state — track launched engine process
 if "engine_process" not in st.session_state:
@@ -447,7 +440,7 @@ if st.sidebar.button("Add Slug") and new_slug_input.strip():
 # ---- OVERVIEW ----
 with tab_overview:
     st.header("Account Overview")
-    open_pos = _scalar("SELECT COUNT(*) FROM positions WHERE status='OPEN'")
+    open_pos = positions_repo.open_count()
     total_notional = _scalar("SELECT COALESCE(SUM(notional),0) FROM positions WHERE status='OPEN'")
     realized_pnl = _scalar("SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE status='CLOSED'")
     pending_orders = _scalar("SELECT COUNT(*) FROM orders WHERE status='PENDING'")

@@ -129,6 +129,18 @@ async def alert_error(context: str, error: str) -> None:
     await send(f"<b>Error in {context}</b>:\n<code>{error[:300]}</code>")
 
 
+async def alert_reconcile_failures(count: int, context: str, error: str) -> None:
+    """Escalation alert (Phase 6, item 1): fired when a reconciler path
+    (positions, paper resolutions, or order reconcile -- see `context`)
+    has failed this many consecutive cycles in a row. Distinct from
+    alert_error so this specific failure class is greppable/filterable
+    in chat history."""
+    await send(
+        f"<b>RECONCILE FAILING</b> ({count} consecutive misses)\n"
+        f"Context: {context}\n<code>{error[:300]}</code>"
+    )
+
+
 class HeartbeatTask:
     """Send a periodic heartbeat message."""
 

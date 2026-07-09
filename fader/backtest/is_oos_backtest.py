@@ -27,9 +27,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from backtest.engine import BacktestConfig, run_backtest
-from backtest.historical import ContractPriceStore
-from backtest.metrics import compute_all_metrics
+from backtest.engine import BacktestConfig
+from backtest.harness import load_store, run_config
+from backtest.report import write_report
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +99,15 @@ def _run_candidate(cand: Candidate, df: pd.DataFrame, n_bootstrap: int = 4000) -
         n_bootstrap=n_bootstrap,
     )
     try:
-        trades_df, equity_df = run_backtest(df, cfg)
+        row = run_config(df, cfg)
     except Exception as e:
         logger.warning(f"{cand.label}: backtest failed: {e}")
         return {"empty": True, "error": str(e)}
 
-    if trades_df.empty:
+    if row.empty:
         return {"empty": True, "n_trades": 0}
 
-    m = compute_all_metrics(trades_df, n_bootstrap=n_bootstrap)
-    return {"empty": False, "metrics": m, "trades_df": trades_df, "equity_df": equity_df}
+    return {"empty": False, "metrics": row.metrics, "trades_df": row.trades_df}
 
 
 # ---------------------------------------------------------------------------
@@ -343,8 +342,7 @@ def main() -> None:
     )
 
     print("Loading historical data...")
-    store = ContractPriceStore()
-    df = store.snapshot()
+    df = load_store()
     if df.empty:
         print("No historical data. Run historical fetch first.")
         return
@@ -406,8 +404,7 @@ def main() -> None:
     )
 
     out_path = DATA_DIR / "is_oos_report.md"
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(report, encoding="utf-8")
+    write_report(out_path, "", [report])
     print(f"\nReport -> {out_path}")
 
     print()

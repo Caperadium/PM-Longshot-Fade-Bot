@@ -9,3 +9,4 @@ pyyaml>=6.0.1
 streamlit>=1.44.0
 python-telegram-bot>=21.0
 plotly>=5.18.0
+scipy>=1.11.0

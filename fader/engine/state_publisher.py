@@ -7,11 +7,12 @@ for dashboard consumption. Runs as asyncio task.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict
+
+from persistence.repos import engine_state_repo, positions_repo, orders_repo
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +22,7 @@ def _utc_now() -> str:
 
 
 def _set(key: str, value: Any) -> None:
-    from infra.db import execute_write
-    now = _utc_now()
-    execute_write(
-        "INSERT OR REPLACE INTO engine_state (key, value_json, updated_at) VALUES (?, ?, ?)",
-        (key, json.dumps(value, default=str), now),
-    )
+    engine_state_repo.publish(key, value)
 
 
 class StatePublisher:
@@ -89,17 +85,8 @@ class StatePublisher:
         _set("token_last_update_ages", ages)
 
         # Open position count
-        from infra.db import get_connection
-        conn = get_connection()
-        try:
-            n_open = conn.execute(
-                "SELECT COUNT(*) FROM positions WHERE status='OPEN'"
-            ).fetchone()[0]
-            n_orders = conn.execute(
-                "SELECT COUNT(*) FROM orders WHERE status='PENDING'"
-            ).fetchone()[0]
-        finally:
-            conn.close()
+        n_open = positions_repo.open_count()
+        n_orders = orders_repo.pending_count()
         _set("open_positions", n_open)
         _set("pending_orders", n_orders)
         _set("engine_start_ts", self._start_ts)

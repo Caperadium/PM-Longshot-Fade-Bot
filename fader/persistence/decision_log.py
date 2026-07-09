@@ -6,12 +6,10 @@ Every filter evaluation (pass OR reject) writes one decisions row.
 
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from infra.db import get_connection
+from persistence.repos import decisions_repo
 
 logger = logging.getLogger(__name__)
 
@@ -24,27 +22,14 @@ def log_decision(
     filters: Dict[str, Any],
     order_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
-) -> None:
-    ts = datetime.now(timezone.utc).isoformat()
-    conn = get_connection()
-    try:
-        conn.execute(
-            """
-            INSERT INTO decisions
-              (ts, slug, token_id, decision, reason, filters_json, order_id, idempotency_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ts, slug, token_id, decision, reason,
-                json.dumps(filters, default=str),
-                order_id, idempotency_key,
-            ),
-        )
-        conn.commit()
-    except Exception as e:
-        logger.error(f"log_decision failed: {e}")
-    finally:
-        conn.close()
+) -> bool:
+    """Insert a decisions row. Returns True on success, False on failure
+    (previously swallowed the exception silently and returned None;
+    callers that care now get an honest signal -- see order_manager's
+    warning-on-False, Phase 1 of the architecture refactor)."""
+    return decisions_repo.append(
+        slug, token_id, decision, reason, filters, order_id, idempotency_key,
+    )
 
 
 def log_entered(
@@ -53,9 +38,9 @@ def log_entered(
     filters: Dict[str, Any],
     order_id: str,
     idempotency_key: str,
-) -> None:
-    log_decision(slug, token_id, "ENTERED", "all_filters_passed",
-                 filters, order_id, idempotency_key)
+) -> bool:
+    return log_decision(slug, token_id, "ENTERED", "all_filters_passed",
+                         filters, order_id, idempotency_key)
 
 
 def log_rejected(
@@ -63,5 +48,5 @@ def log_rejected(
     token_id: Optional[str],
     reason: str,
     filters: Dict[str, Any],
-) -> None:
-    log_decision(slug, token_id, "REJECTED", reason, filters)
+) -> bool:
+    return log_decision(slug, token_id, "REJECTED", reason, filters)

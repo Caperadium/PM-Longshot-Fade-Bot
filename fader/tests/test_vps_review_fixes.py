@@ -81,6 +81,73 @@ class TestBankrollSource(unittest.TestCase):
 
 
 # =========================================================================
+# Phase 3: BankrollView (reconciler.bankroll_view) -- additive, does not
+# touch the float `bankroll`/`bankroll_fn` plumbing tested above.
+# =========================================================================
+
+class TestBankrollView(unittest.IsolatedAsyncioTestCase):
+    def _make_loop(self):
+        from engine.strategy_loop import StrategyLoop
+        return StrategyLoop(
+            cfg=MagicMock(), book_store=MagicMock(),
+            staleness=MagicMock(), risk=MagicMock(),
+        )
+
+    def test_no_view_source_wired_returns_none_age(self):
+        sl = self._make_loop()
+        self.assertIsNone(sl._bankroll_age_s())
+
+    def test_age_reflects_time_since_as_of(self):
+        from engine.reconciler import BankrollView
+        sl = self._make_loop()
+        as_of = time.monotonic() - 45.0
+        sl.set_bankroll_view_source(lambda: BankrollView(value=500.0, as_of=as_of))
+        age = sl._bankroll_age_s()
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 45.0)
+
+    def test_never_reconciled_as_of_zero_returns_none(self):
+        from engine.reconciler import BankrollView
+        sl = self._make_loop()
+        sl.set_bankroll_view_source(lambda: BankrollView(value=0.0, as_of=0.0))
+        self.assertIsNone(sl._bankroll_age_s())
+
+    def test_view_source_raising_returns_none(self):
+        sl = self._make_loop()
+        sl.set_bankroll_view_source(lambda: 1 / 0)
+        self.assertIsNone(sl._bankroll_age_s())
+
+    def test_reconciler_bankroll_stays_float_type(self):
+        """reconciler.bankroll must remain a bare float -- five call sites
+        (main.py set_bankroll/set_bankroll_source, state_publisher's
+        json.dumps, strategy_loop's float(...) wrapper) fail silently on
+        anything else. bankroll_view is a SEPARATE, additive property."""
+        from engine.reconciler import Reconciler
+        rc = Reconciler(provider=MagicMock(), risk=MagicMock())
+        self.assertIsInstance(rc.bankroll, float)
+        view = rc.bankroll_view
+        self.assertEqual(view.value, rc.bankroll)
+        self.assertIsInstance(view.as_of, float)
+
+    async def test_bankroll_reconcile_updates_view_as_of(self):
+        from engine.reconciler import Reconciler
+        provider = MagicMock()
+        provider.async_fetch_usdc_balance = AsyncMock(return_value=250.0)
+        risk = MagicMock()
+        risk.check_breaker_against_bankroll.return_value = False
+        rc = Reconciler(provider=provider, risk=risk)
+
+        before = rc.bankroll_view.as_of
+        with patch("engine.reconciler.engine_state_repo") as mock_repo:
+            await rc._reconcile_bankroll()
+
+        self.assertEqual(rc.bankroll, 250.0)
+        self.assertEqual(rc.bankroll_view.value, 250.0)
+        self.assertGreater(rc.bankroll_view.as_of, before)
+        mock_repo.publish.assert_called_once_with("bankroll", 250.0)
+
+
+# =========================================================================
 # R2: failed cancel keeps order tracked, blocks requote replacement
 # =========================================================================
 
@@ -90,12 +157,13 @@ class TestCancelFailureSafety(_DbTestCase):
     def _make_om(self, cancel_result):
         from execution.order_manager import OrderManager, RestingOrder
         from config.config_loader import load_config
+        from tests.helpers import make_order_result
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_cancel_order = AsyncMock(return_value=cancel_result)
         provider.async_place_order = AsyncMock(
-            return_value={"success": True, "order_id": "new-1"}
+            return_value=make_order_result(status="PENDING", order_id="new-1")
         )
         om = OrderManager(cfg=cfg, provider=provider)
         om._resting["0xT"] = RestingOrder(
@@ -180,7 +248,7 @@ class TestReconcilerFilledDetection(_DbTestCase):
     async def _reconcile(self):
         from engine.reconciler import Reconciler
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_fetch_open_orders = AsyncMock(return_value=[])
         om = MagicMock()
         rec = Reconciler(provider=provider, risk=MagicMock(), order_manager=om)
@@ -204,6 +272,14 @@ class TestReconcilerFilledDetection(_DbTestCase):
 
 # =========================================================================
 # R4: breaker UTC day rollover
+#
+# Phase 3 (Single-owner state) deleted the in-memory _breaker_tripped/
+# _tripped_day flags and their self-resetting logic. breaker_tripped is
+# now a read-through property backed by the circuit_breaker DB row keyed
+# by UTC day (via BreakerRepo), memoized <=1s. "Rollover" is now implicit:
+# a trip recorded for a past day simply has no row for today, so there is
+# nothing to explicitly reset. Tests write through BreakerRepo instead of
+# poking deleted fields directly.
 # =========================================================================
 
 class TestBreakerDayRollover(_DbTestCase):
@@ -211,11 +287,11 @@ class TestBreakerDayRollover(_DbTestCase):
 
     async def test_tripped_yesterday_clears_today(self):
         from engine.risk import RiskManager
+        from persistence.repos import breaker_repo
         rm = RiskManager(daily_loss_pct=5.0)
-        rm._breaker_tripped = True
         yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1))
-        rm._tripped_day = yesterday.isoformat()
-        self.assertFalse(rm.breaker_tripped)  # auto-reset on rollover
+        breaker_repo.trip(yesterday.isoformat())
+        self.assertFalse(rm.breaker_tripped)  # no row for today -> untripped
 
     async def test_tripped_today_stays_tripped(self):
         from engine.risk import RiskManager
@@ -225,12 +301,68 @@ class TestBreakerDayRollover(_DbTestCase):
 
     async def test_allow_entry_uses_rollover_aware_check(self):
         from engine.risk import RiskManager
+        from persistence.repos import breaker_repo
         rm = RiskManager(daily_loss_pct=5.0, max_deployed_pct=100.0,
                          per_market_cap_pct=100.0)
-        rm._breaker_tripped = True
-        rm._tripped_day = "2020-01-01"
+        breaker_repo.trip("2020-01-01")
         allowed, reason = rm.allow_entry("slug", 10.0, 1000.0, 0.0, 0.0)
         self.assertTrue(allowed, reason)
+
+    async def test_breaker_trip_persists_across_riskmanager_reinstantiation(self):
+        """Restart-safety: a trip recorded by one RiskManager instance
+        (simulating a process restart) must be visible to a brand new
+        instance with no shared in-memory state -- the DB row is the only
+        source of truth."""
+        from engine.risk import RiskManager
+        rm1 = RiskManager(daily_loss_pct=5.0)
+        rm1._trip(rm1.today_utc())
+        self.assertTrue(rm1.breaker_tripped)
+
+        rm2 = RiskManager(daily_loss_pct=5.0)  # fresh instance, no memo yet
+        self.assertTrue(rm2.breaker_tripped)
+
+    async def test_breaker_reset_clears_trip_for_fresh_instance(self):
+        from engine.risk import RiskManager
+        rm1 = RiskManager(daily_loss_pct=5.0)
+        rm1._trip(rm1.today_utc())
+        rm1.reset_breaker()
+
+        rm2 = RiskManager(daily_loss_pct=5.0)
+        self.assertFalse(rm2.breaker_tripped)
+
+    async def test_breaker_reset_command_round_trip(self):
+        """Full dashboard -> engine round trip: issue_command("breaker_reset")
+        writes a control_commands row; ControlConsumer polls it and
+        dispatches to the same on_command callback main.py wires up
+        (engine/control.py's make_on_command), which calls
+        engine.risk.reset_breaker() -- writing through BreakerRepo. A
+        second RiskManager instance (simulating the dashboard's own
+        read, or a restarted engine) must see the reset."""
+        from engine.risk import RiskManager
+        from engine.control_consumer import ControlConsumer, issue_command
+        from engine.control import make_on_command
+
+        rm = RiskManager(daily_loss_pct=5.0)
+        rm._trip(rm.today_utc())
+        self.assertTrue(rm.breaker_tripped)
+
+        engine = MagicMock()
+        engine.risk = rm
+        cfg = MagicMock()
+        config_watcher = MagicMock()
+        stop_event = asyncio.Event()
+        restart_requested = {"flag": False}
+        on_command = make_on_command(engine, cfg, config_watcher, stop_event, restart_requested)
+
+        consumer = ControlConsumer(breaker_reset_cb=on_command)
+        issue_command("breaker_reset")
+        await consumer._process_pending()
+
+        self.assertFalse(rm.breaker_tripped)
+        # A second, independent RiskManager sees the same reset (DB is
+        # the only source of truth -- no in-memory flag to resync).
+        rm2 = RiskManager(daily_loss_pct=5.0)
+        self.assertFalse(rm2.breaker_tripped)
 
 
 # =========================================================================
@@ -313,6 +445,9 @@ class TestRetentionPruning(_DbTestCase):
 # =========================================================================
 
 class TestPlaceOrderRejectionBody(unittest.TestCase):
+    """Phase 2: place_order returns a typed OrderResult, not a dict --
+    success=false without a duplicate signal maps to status='REJECTED'."""
+
     def test_success_false_body_is_failure(self):
         from execution.provider import Provider
         provider = Provider(limiter=MagicMock(), mode="live")
@@ -322,8 +457,9 @@ class TestPlaceOrderRejectionBody(unittest.TestCase):
         }
         provider._clob_client = fake_client
         result = provider.place_order("0xT", "BUY", 0.85, 10.0, "MARKET")
-        self.assertFalse(result["success"])
-        self.assertIn("FOK", result["error"])
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, "REJECTED")
+        self.assertIn("FOK", result.error)
 
     def test_success_true_body_passes_through(self):
         from execution.provider import Provider
@@ -334,8 +470,9 @@ class TestPlaceOrderRejectionBody(unittest.TestCase):
         }
         provider._clob_client = fake_client
         result = provider.place_order("0xT", "BUY", 0.85, 10.0, "MARKET")
-        self.assertTrue(result["success"])
-        self.assertEqual(result["order_id"], "0xORDER")
+        self.assertTrue(result.success)
+        self.assertEqual(result.status, "PENDING")
+        self.assertEqual(result.order_id, "0xORDER")
 
 
 # =========================================================================

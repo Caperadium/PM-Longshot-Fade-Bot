@@ -28,9 +28,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from execution.sizing import MIN_EFFECTIVE_NOTIONAL
+from execution.sizing import MIN_EFFECTIVE_NOTIONAL, compute_shares_and_notional
+from strategy.filters import EntrySnapshot, FilterParams, evaluate_entry, evaluate_pregate
 
 logger = logging.getLogger(__name__)
+
+# Filters not reconstructable from historical Polymarket data (Phase 4):
+# volumes/depth/staleness are always None in a backtest EntrySnapshot, so
+# evaluate_entry() always records them in FilterResult.skipped. Listed here
+# once so run_backtest() doesn't need to special-case which names those are.
+BACKTEST_ALWAYS_SKIPPED: Tuple[str, ...] = ("min_24h_volume", "min_total_volume", "min_book_depth")
 
 
 @dataclass
@@ -142,6 +149,28 @@ def run_backtest(
     all_dates = sorted({r["date"] for r in all_rows})
     equity_by_date: Dict[str, float] = {d: 0.0 for d in all_dates}
 
+    # Shared filter core (Phase 4, strategy/filters.py) params for this run.
+    # min_time_in_band_s = max(1, min_time_in_band_days) * 86400 is
+    # algebraically identical to the old `days_in_band < max(1, ...)`
+    # day-count comparison -- seconds_in_band below is days_in_band*86400.
+    # missing_dte="skip": backtest's fail-open dte=None handling (pinned by
+    # test_backtest_engine.py's TestDteNoneRowsFailOpenPin) is preserved.
+    # check_staleness=False: the backtest has no staleness concept at all
+    # (unlike paper's carve-out, which still HAS a staleness signal it
+    # chooses to ignore) -- there's nothing to skip-and-record here beyond
+    # the fixed 3 volume/depth filters in BACKTEST_ALWAYS_SKIPPED.
+    # Volume/depth thresholds are irrelevant (always 0.0): the
+    # corresponding EntrySnapshot fields are always None, so evaluate_entry
+    # always treats them as skipped regardless of the threshold value.
+    params = FilterParams(
+        band_low=cfg.band_low, band_high=cfg.band_high,
+        min_dte=cfg.min_dte, max_dte=cfg.max_dte,
+        min_time_in_band_s=max(1, cfg.min_time_in_band_days) * 86400,
+        min_24h_volume=0.0, min_total_volume=0.0, min_book_depth=0.0,
+        check_staleness=False, check_time_in_band=True,
+        missing_dte="skip",
+    )
+
     for (slug, token_id), rows in groups.items():
         days_in_band = 0
         in_position = False
@@ -167,7 +196,10 @@ def run_backtest(
                     payout = 1.0 if resolution == "NO" else 0.0
                     ep = float(entry_row["price"])
                     notional = float(entry_row.get("effective_notional", str(cfg.order_notional_usd)))
-                    size = _compute_size(notional, ep)
+                    # NOTE: BacktestTrade.notional is the STAKE (unchanged
+                    # below), not size*price -- only the size element of
+                    # the returned tuple is used here (Phase 5 trap (a)).
+                    size, _ = compute_shares_and_notional(notional, ep)
                     pnl = (payout - ep) * size
                     mae = max(0.0, ep - min_price_open)
                     t = BacktestTrade(
@@ -204,14 +236,16 @@ def run_backtest(
             if not in_band:
                 days_in_band = 0
 
-            # DTE filter
+            # DTE filter (shared core, filters 1-2; band re-checked here is
+            # redundant with `in_band` above but keeps evaluate_pregate as
+            # the single source of truth for the reject reason/policy).
             if end_date:
                 dte = compute_dte_from_dates(date, end_date)
             else:
                 dte = None
-            if dte is not None:
-                if not (cfg.min_dte <= dte <= cfg.max_dte):
-                    continue
+            pregate = evaluate_pregate(price, dte, params)
+            if pregate.reason == "dte_out_of_range":
+                continue
 
             # Increment days-in-band AFTER DTE passes. This prevents
             # DTE-invalid days from accruing into the counter when DTE
@@ -219,8 +253,20 @@ def run_backtest(
             if in_band:
                 days_in_band += 1
 
-            # Band + min_time_in_band
-            if not in_band or days_in_band < max(1, cfg.min_time_in_band_days):
+            # Filters 1+3: band + min_time_in_band, via the shared core.
+            # seconds_in_band = days_in_band * 86400 and
+            # min_time_in_band_s = max(1, min_time_in_band_days) * 86400
+            # (set on `params` above) are algebraically identical to the
+            # old day-count comparison.
+            snapshot = EntrySnapshot(
+                best_ask=price if in_band else None,
+                dte=dte,
+                seconds_in_band=days_in_band * 86400,
+                volume_24h=None, volume_total=None, ask_depth_usd=None,
+                is_stale=None, has_open_position=False,
+            )
+            result = evaluate_entry(snapshot, params)
+            if not result.passed:
                 continue
 
             # Apply slippage
@@ -249,11 +295,12 @@ def run_backtest(
         eq_rows.append({"date": d, "daily_pnl": equity_by_date[d], "cumulative_pnl": cumulative})
     equity_df = pd.DataFrame(eq_rows) if eq_rows else pd.DataFrame()
 
+    # Surface the skipped-filter union in result metadata (Phase 4) without
+    # changing the (trades_df, equity_df) 2-tuple return shape that every
+    # caller (allocation_analysis, band_sweep, crypto_sweep, grid_sweep,
+    # is_oos_backtest, walkforward, dashboard) unpacks today. DataFrame
+    # .attrs survives .copy() and is the least-invasive place to attach
+    # run metadata; compute_all_metrics(..., skipped_filters=...) reads it.
+    trades_df.attrs["skipped_filters"] = BACKTEST_ALWAYS_SKIPPED
+
     return trades_df, equity_df
-
-
-def _compute_size(notional: float, price: float) -> float:
-    import math
-    if price <= 0 or price >= 1:
-        return 0.0
-    return math.floor((notional / price) * 100) / 100

@@ -109,7 +109,7 @@ class _DbTestCase(unittest.IsolatedAsyncioTestCase):
     def _make_reconciler(self, risk=None, order_manager=None):
         from engine.reconciler import Reconciler
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         return Reconciler(
             provider=provider, risk=risk or MagicMock(), order_manager=order_manager,
         )
@@ -281,7 +281,7 @@ class TestFullReconcileNoZeroClose(_DbTestCase):
         import engine.reconciler as reconciler_mod
         from engine.reconciler import Reconciler
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         provider.async_fetch_usdc_balance = AsyncMock(return_value=100.0)
 
         with patch.object(reconciler_mod, "fetch_market_metadata", return_value=meta), \
@@ -306,7 +306,7 @@ class TestFullReconcileNoZeroClose(_DbTestCase):
         import engine.reconciler as reconciler_mod
         from engine.reconciler import Reconciler
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         provider.async_fetch_usdc_balance = AsyncMock(return_value=100.0)
 
         with patch.object(reconciler_mod, "fetch_market_metadata", return_value=meta), \
@@ -331,7 +331,7 @@ class TestInsertPositionFallbackId(_DbTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         om = OrderManager(cfg=cfg, provider=provider)
 
         om._insert_position(
@@ -357,16 +357,25 @@ class TestInsertPositionFallbackId(_DbTestCase):
         )
 
     async def test_place_limit_paper_fill_threads_market_info_through(self):
-        """M3: enter() threads market_info into _place_limit's paper branch,
+        """M3: enter() threads market_info into _place_limit's fill path,
         so a paper limit fill with market_info gets the canonical
-        {user}:{condition_id}:{outcome_index} id, not the token fallback."""
+        {user}:{condition_id}:{outcome_index} id, not the token fallback.
+
+        Phase 2: paper/live limit dispatch is unified via OrderResult.status
+        (no more provider._mode special-casing inside _place_limit), so the
+        mock provider must return a FILLED OrderResult from async_place_order
+        the way PaperProvider.place_order actually does."""
         from execution.order_manager import OrderManager
         from execution.provider import MarketInfo
         from config.config_loader import load_config
+        from tests.helpers import make_order_result
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
+        provider.async_place_order = AsyncMock(
+            return_value=make_order_result(status="FILLED", order_id="SIM-m")
+        )
         om = OrderManager(cfg=cfg, provider=provider)
 
         book = MagicMock()
@@ -417,7 +426,7 @@ class TestCancelRestingCaseInsensitive(_DbTestCase):
             ),
         ]
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_cancel_order = AsyncMock(return_value={"success": True})
 
         om = OrderManager(cfg=cfg, provider=provider)
@@ -447,7 +456,7 @@ class TestCancelRestingCaseInsensitive(_DbTestCase):
             ),
         ]
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_cancel_order = AsyncMock(return_value={"success": True})
 
         om = OrderManager(cfg=cfg, provider=provider)
@@ -480,7 +489,7 @@ class TestPaperCloseAll(_DbTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         provider.async_cancel_all = AsyncMock(return_value={"success": True})
 
         om = OrderManager(cfg=cfg, provider=provider)
@@ -511,7 +520,7 @@ class TestPaperCloseAll(_DbTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         provider.async_cancel_all = AsyncMock(return_value={"success": True})
         provider.async_fetch_usdc_balance = AsyncMock(return_value=100.0)
 
@@ -534,6 +543,378 @@ class TestPaperCloseAll(_DbTestCase):
         row = self._get_position("pos-ca-3")
         self.assertEqual(row["status"], "CLOSED")
         self.assertEqual(row["realized_pnl"], 0.0)
+
+
+# =========================================================================
+# Phase 6, item 1: reconcile-failure escalation counter
+# =========================================================================
+
+class TestReconcileFailureEscalation(_DbTestCase):
+    db_name = "test_fader_reconcile_escalation.db"
+
+    def _get_state(self, key):
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT value_json FROM engine_state WHERE key=?", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            import json as _json
+            return _json.loads(row["value_json"])
+        finally:
+            conn.close()
+
+    async def test_counter_increments_on_consecutive_paper_failures(self):
+        rec = self._make_reconciler()
+
+        import engine.reconciler as reconciler_mod
+        with patch.object(
+            reconciler_mod.positions_repo, "open_for_paper_poll",
+            side_effect=RuntimeError("boom"),
+        ), patch("infra.telegram.fire", side_effect=_swallow_fire):
+            for expected in (1, 2, 3):
+                await rec._reconcile_paper_resolutions()
+                self.assertEqual(rec.reconcile_failures, expected)
+                self.assertEqual(self._get_state("reconcile_failures"), expected)
+
+    async def test_telegram_alert_fires_after_five_consecutive_misses(self):
+        rec = self._make_reconciler()
+
+        import engine.reconciler as reconciler_mod
+        with patch.object(
+            reconciler_mod.positions_repo, "open_for_paper_poll",
+            side_effect=RuntimeError("boom"),
+        ), patch("infra.telegram.fire", side_effect=_swallow_fire) as fire_mock:
+            for _ in range(4):
+                await rec._reconcile_paper_resolutions()
+            fire_mock.assert_not_called()
+
+            await rec._reconcile_paper_resolutions()  # 5th consecutive miss
+            self.assertEqual(rec.reconcile_failures, 5)
+            fire_mock.assert_called_once()
+
+    async def test_counter_resets_on_success(self):
+        rec = self._make_reconciler()
+
+        import engine.reconciler as reconciler_mod
+        with patch.object(
+            reconciler_mod.positions_repo, "open_for_paper_poll",
+            side_effect=RuntimeError("boom"),
+        ), patch("infra.telegram.fire", side_effect=_swallow_fire):
+            await rec._reconcile_paper_resolutions()
+            await rec._reconcile_paper_resolutions()
+            self.assertEqual(rec.reconcile_failures, 2)
+
+        # Next cycle succeeds (no open positions -> early success return).
+        with patch.object(
+            reconciler_mod.positions_repo, "open_for_paper_poll", return_value=[],
+        ), patch("infra.telegram.fire", side_effect=_swallow_fire):
+            await rec._reconcile_paper_resolutions()
+
+        self.assertEqual(rec.reconcile_failures, 0)
+        self.assertEqual(self._get_state("reconcile_failures"), 0)
+
+
+# =========================================================================
+# Bugfix plan Bug 2: order-reconcile escalation blind spot.
+#
+# _reconcile_orders' fetch_open_orders()->None path previously logged a
+# warning and returned with no counter, no engine_state signal, and no
+# telegram alert -- a persistent order-API outage produced warnings
+# forever with no escalation. Fixed via a SEPARATE counter
+# (_order_reconcile_failures), mirroring the existing positions/paper
+# escalation mechanism (>= threshold fires every cycle, not once).
+# =========================================================================
+
+class TestOrderReconcileFailureEscalation(_DbTestCase):
+    db_name = "test_fader_order_reconcile_escalation.db"
+
+    def _get_state(self, key):
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT value_json FROM engine_state WHERE key=?", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            import json as _json
+            return _json.loads(row["value_json"])
+        finally:
+            conn.close()
+
+    def _make_live_reconciler(self, fetch_open_orders_return):
+        from engine.reconciler import Reconciler
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(
+            return_value=fetch_open_orders_return
+        )
+        return Reconciler(provider=provider, risk=MagicMock(), order_manager=None)
+
+    async def test_none_x6_counter_climbs_and_alert_fires_twice(self):
+        """fetch_open_orders() -> None six times in a row: counter climbs
+        1..6; alert fires at 5 AND at 6 (pins the >= fire-repeatedly
+        semantics -- a x5-only test can't distinguish fire-once from
+        fire-every-cycle-at-or-above-threshold); engine_state key
+        published each cycle."""
+        rec = self._make_live_reconciler(None)
+
+        with patch("infra.telegram.fire", side_effect=_swallow_fire) as fire_mock:
+            for expected in range(1, 7):
+                await rec._reconcile_orders()
+                self.assertEqual(rec.order_reconcile_failures, expected)
+                self.assertEqual(
+                    self._get_state("order_reconcile_failures"), expected
+                )
+
+        self.assertEqual(fire_mock.call_count, 2)
+
+    async def test_none_x3_then_success_resets_counter(self):
+        """Three consecutive None failures bump the counter; a subsequent
+        successful cycle (empty live order list, no DB rows) resets it to
+        0 and re-publishes."""
+        rec = self._make_live_reconciler(None)
+
+        with patch("infra.telegram.fire", side_effect=_swallow_fire):
+            for _ in range(3):
+                await rec._reconcile_orders()
+            self.assertEqual(rec.order_reconcile_failures, 3)
+
+        rec._provider.async_fetch_open_orders = AsyncMock(return_value=[])
+        with patch("infra.telegram.fire", side_effect=_swallow_fire) as fire_mock:
+            await rec._reconcile_orders()
+
+        self.assertEqual(rec.order_reconcile_failures, 0)
+        self.assertEqual(self._get_state("order_reconcile_failures"), 0)
+        fire_mock.assert_not_called()
+
+    async def test_paper_mode_counter_stays_zero(self):
+        """Paper mode returns before the fetch -- no order API in paper --
+        so the order-reconcile counter must never move."""
+        rec = self._make_reconciler()  # is_paper=True via _DbTestCase helper
+
+        await rec._reconcile_orders()
+
+        self.assertEqual(rec.order_reconcile_failures, 0)
+        self.assertIsNone(self._get_state("order_reconcile_failures"))
+
+
+# =========================================================================
+# Phase 6, item 8: order-reaper CANCELLED persists (was a silent no-commit)
+# =========================================================================
+
+class TestReaperPersistsCancelled(_DbTestCase):
+    db_name = "test_fader_reaper_persist.db"
+
+    def _insert_unknown_order(self, order_id, token_id, created_at):
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO orders
+                  (order_id, idempotency_key, slug, token_id, side, type,
+                   price, size, status, created_at)
+                VALUES (?, ?, 'slug-reap', ?, 'BUY', 'LIMIT', 0.85, 10.0,
+                        'UNKNOWN', ?)
+                """,
+                (order_id, f"ik-{order_id}", token_id, created_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _get_order(self, order_id):
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            return conn.execute(
+                "SELECT * FROM orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    async def test_stale_unknown_order_actually_persists_as_cancelled(self):
+        from datetime import timedelta
+
+        # NOTE: the timestamp-format bug this comment used to describe
+        # (ISO 'T' strings vs SQLite datetime() output making sub-day gaps
+        # compare wrong) is now FIXED -- reap_stale_unknown computes a
+        # Python-side ISO cutoff and TestReaperTtlPinned covers the 1h TTL
+        # semantics with pinned timestamps. The 2-day-old timestamp here is
+        # retained so this test stays about the commit/persistence fix
+        # (Phase 6 item 8), independent of TTL boundary behavior.
+        stale_ts = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        self._insert_unknown_order("o-stale-1", "0xTOKSTALE", stale_ts)
+
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=[])
+
+        risk = MagicMock()
+        from engine.reconciler import Reconciler
+        rec = Reconciler(provider=provider, risk=risk, order_manager=None)
+
+        await rec._reconcile_orders()
+
+        # Re-fetch on a FRESH connection -- if the reaper's UPDATE never
+        # committed (the pre-Phase-6 bug), this would still read UNKNOWN.
+        row = self._get_order("o-stale-1")
+        self.assertEqual(row["status"], "CANCELLED")
+        self.assertEqual(row["cancel_reason"], "unknown_ttl")
+
+    async def test_fresh_unknown_order_not_reaped(self):
+        fresh_ts = datetime.now(timezone.utc).isoformat()
+        self._insert_unknown_order("o-fresh-1", "0xTOKFRESH", fresh_ts)
+
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=[])
+
+        risk = MagicMock()
+        from engine.reconciler import Reconciler
+        rec = Reconciler(provider=provider, risk=risk, order_manager=None)
+
+        await rec._reconcile_orders()
+
+        row = self._get_order("o-fresh-1")
+        self.assertEqual(row["status"], "UNKNOWN")
+
+
+# =========================================================================
+# Bugfix plan Bug 1: reap_stale_unknown timestamp-format mismatch.
+#
+# created_at is written as datetime.isoformat() ("...T07:05:11.231837+00:00",
+# 'T' separator, microseconds, offset). The pre-fix SQL compared that
+# directly against SQLite's datetime(?, '-3600 seconds'), which returns
+# "YYYY-MM-DD HH:MM:SS" (space separator, no offset, no microseconds).
+# Raw string collation puts 'T' (0x54) > ' ' (0x20), so any created_at on
+# the SAME UTC date as the cutoff compares GREATER than the cutoff and is
+# never reaped -- the reap only fires once the date prefix itself differs,
+# making the effective TTL ~1 day instead of 1 hour.
+#
+# ALL tests in this class use a PINNED synthetic now_iso, never wall-clock:
+# a wall-clock "2 hours old, same day" test would spuriously PASS pre-fix
+# whenever it happens to run in the first ~2 hours of a UTC day (date
+# prefix already differs), silently hiding the bug depending on run time.
+# =========================================================================
+
+class TestReaperTtlPinned(_DbTestCase):
+    db_name = "test_fader_reaper_ttl_pinned.db"
+
+    # Same UTC date throughout -- this is the whole point of the bug.
+    PINNED_NOW_ISO = "2026-01-15T12:00:00.000000+00:00"
+
+    def _insert_unknown_order(self, order_id, token_id, created_at):
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO orders
+                  (order_id, idempotency_key, slug, token_id, side, type,
+                   price, size, status, created_at)
+                VALUES (?, ?, 'slug-reap-pinned', ?, 'BUY', 'LIMIT', 0.85, 10.0,
+                        'UNKNOWN', ?)
+                """,
+                (order_id, f"ik-{order_id}", token_id, created_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _insert_order_with_status(self, order_id, token_id, status, created_at):
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO orders
+                  (order_id, idempotency_key, slug, token_id, side, type,
+                   price, size, status, created_at)
+                VALUES (?, ?, 'slug-reap-pinned', ?, 'BUY', 'LIMIT', 0.85, 10.0,
+                        ?, ?)
+                """,
+                (order_id, f"ik-{order_id}", token_id, status, created_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _get_order(self, order_id):
+        from infra.db import get_connection
+        conn = get_connection()
+        try:
+            return conn.execute(
+                "SELECT * FROM orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_1_two_hours_before_pinned_now_same_date_is_reaped(self):
+        """Test #1 (red-green): UNKNOWN order 2h before a PINNED now_iso, on
+        the SAME UTC date, must be reaped. This is the exact case the
+        buggy string comparison missed -- demonstrated failing against
+        pre-fix code, then passing post-fix (see task report)."""
+        from persistence.repos import orders_repo
+
+        created_at = "2026-01-15T10:00:00.000000+00:00"  # 2h before pinned now
+        self._insert_unknown_order("o-pinned-2h", "0xTOKP2H", created_at)
+
+        orders_repo.reap_stale_unknown(self.PINNED_NOW_ISO)
+
+        row = self._get_order("o-pinned-2h")
+        self.assertEqual(row["status"], "CANCELLED")
+        self.assertEqual(row["cancel_reason"], "unknown_ttl")
+
+    def test_2_thirty_minutes_before_pinned_now_not_reaped(self):
+        """TTL is 1h, not 0 -- a 30-minute-old UNKNOWN order must survive."""
+        from persistence.repos import orders_repo
+
+        created_at = "2026-01-15T11:30:00.000000+00:00"  # 30 min before now
+        self._insert_unknown_order("o-pinned-30m", "0xTOKP30M", created_at)
+
+        orders_repo.reap_stale_unknown(self.PINNED_NOW_ISO)
+
+        row = self._get_order("o-pinned-30m")
+        self.assertEqual(row["status"], "UNKNOWN")
+        self.assertIsNone(row["cancel_reason"])
+
+    def test_3_sixty_one_minutes_before_pinned_now_boundary_is_reaped(self):
+        """Boundary case: 61 minutes before pinned now, same UTC date --
+        exactly the gap the string collation bug broke (any same-day
+        created_at compared GREATER than the cutoff regardless of time)."""
+        from persistence.repos import orders_repo
+
+        created_at = "2026-01-15T10:59:00.000000+00:00"  # 61 min before now
+        self._insert_unknown_order("o-pinned-61m", "0xTOKP61M", created_at)
+
+        orders_repo.reap_stale_unknown(self.PINNED_NOW_ISO)
+
+        row = self._get_order("o-pinned-61m")
+        self.assertEqual(row["status"], "CANCELLED")
+        self.assertEqual(row["cancel_reason"], "unknown_ttl")
+
+    def test_4_non_unknown_statuses_untouched(self):
+        """PENDING/FILLED/CANCELLED/FAILED rows old enough to qualify by
+        timestamp alone must NOT be touched -- only status='UNKNOWN' is
+        eligible for the reaper."""
+        from persistence.repos import orders_repo
+
+        old_ts = "2026-01-15T09:00:00.000000+00:00"  # 3h before pinned now
+        for status in ("PENDING", "FILLED", "CANCELLED", "FAILED"):
+            self._insert_order_with_status(
+                f"o-pinned-{status}", f"0xTOK{status}", status, old_ts
+            )
+
+        orders_repo.reap_stale_unknown(self.PINNED_NOW_ISO)
+
+        for status in ("PENDING", "FILLED", "CANCELLED", "FAILED"):
+            row = self._get_order(f"o-pinned-{status}")
+            self.assertEqual(row["status"], status)
 
 
 if __name__ == "__main__":

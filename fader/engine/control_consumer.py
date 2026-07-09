@@ -13,6 +13,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
+from persistence.repos import control_repo
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,14 +61,7 @@ class ControlConsumer:
             await asyncio.sleep(self._poll_s)
 
     async def _process_pending(self) -> None:
-        from infra.db import get_connection
-        conn = get_connection()
-        try:
-            rows = conn.execute(
-                "SELECT id, command, args_json FROM control_commands WHERE status='PENDING' ORDER BY id"
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = control_repo.pending()
 
         for row in rows:
             cmd_id = row["id"]
@@ -97,28 +92,9 @@ class ControlConsumer:
 
 
 def _mark_done(cmd_id: int, result: str) -> None:
-    from infra.db import get_connection
-    conn = get_connection()
-    try:
-        conn.execute(
-            "UPDATE control_commands SET status='DONE', result_json=? WHERE id=?",
-            (json.dumps({"result": result}), cmd_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    control_repo.mark_done(cmd_id, result)
 
 
 def issue_command(command: str, args: Optional[Dict] = None) -> None:
     """Utility: write a command from dashboard or test code."""
-    from infra.db import get_connection
-    now = _utc_now()
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT INTO control_commands (ts, command, args_json, status) VALUES (?, ?, ?, 'PENDING')",
-            (now, command, json.dumps(args or {})),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    control_repo.issue(command, args)

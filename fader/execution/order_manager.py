@@ -22,14 +22,30 @@ from execution.idempotency import make_key, is_already_submitted
 from execution.sizing import compute_shares_and_notional
 from marketdata.rest_market import _derive_series_filter
 from persistence.decision_log import log_entered, log_rejected
+from persistence.repos import db, orders_repo, positions_repo
 
 logger = logging.getLogger(__name__)
+
+
+def _log_entered(slug, token_id, filters, order_id, idempotency_key) -> None:
+    if not log_entered(slug, token_id, filters, order_id, idempotency_key):
+        logger.warning(
+            f"log_entered failed to persist decision row for {slug} ({order_id})"
+        )
+
+
+def _log_rejected(slug, token_id, reason, filters) -> None:
+    if not log_rejected(slug, token_id, reason, filters):
+        logger.warning(
+            f"log_rejected failed to persist decision row for {slug} ({reason})"
+        )
 
 
 class RestingOrder:
     __slots__ = (
         "order_id", "idempotency_key", "slug", "token_id", "price",
         "size", "notional", "placed_at", "ttl_expires_at", "last_mid",
+        "unverified",
     )
 
     def __init__(
@@ -44,6 +60,7 @@ class RestingOrder:
         placed_at: float,
         ttl_s: int,
         mid: float,
+        unverified: bool = False,
     ) -> None:
         self.order_id = order_id
         self.idempotency_key = idempotency_key
@@ -55,6 +72,11 @@ class RestingOrder:
         self.placed_at = placed_at
         self.ttl_expires_at = placed_at + ttl_s
         self.last_mid = mid
+        # Set when this row was rehydrated from DB but could not be
+        # confirmed against the live API (fetch_open_orders() returned
+        # None -- API unavailable, not "no orders"). Re-verified on each
+        # requote tick instead of being dropped or trusted blindly.
+        self.unverified = unverified
 
 
 class OrderManager:
@@ -81,27 +103,49 @@ class OrderManager:
         requote management -> orphan until filled or manually cancelled.
         This closes that gap. Returns the count of orders rehydrated.
 
-        Paper mode: no-op (paper limits fill instantly; no resting orders).
+        Paper mode: DB read only, no API verify -- PaperProvider.place_order
+        always returns status=FILLED (never PENDING), so in practice there
+        are no PENDING LIMIT rows to find; this path exists so a stray row
+        (e.g. left over from a live/paper mode switch) is still surfaced
+        rather than silently ignored, matching main.py's existing
+        `if cfg.mode != "paper"` gate around the startup call site (this
+        method itself no longer hard-codes a paper no-op).
+
+        DB read failure (the SELECT itself raising, e.g. a locked or
+        corrupt file) is fatal at startup: fire a telegram alert and
+        re-raise so main.py's startup sequence aborts rather than running
+        with an empty, unmanaged resting-order set. The supervisor
+        (systemd Restart=always / run_engine_supervised.py) bounds the
+        resulting crash-loop.
         """
-        if self._provider._mode == "paper":
+        try:
+            rows = orders_repo.pending_limit_orders()
+        except Exception as e:
+            logger.error(f"rehydrate_resting: DB read failed — aborting startup: {e}")
+            from infra import telegram
+            await telegram.alert_error("rehydrate_resting (DB read)", str(e))
+            raise
+
+        if self._provider.is_paper:
+            # No API to verify against; paper orders never rest anyway.
             return 0
 
         live = await self._provider.async_fetch_open_orders()
-        live_by_id = {o["order_id"]: o for o in live if o.get("order_id")}
-
-        from infra.db import get_connection
-        conn = get_connection()
-        try:
-            rows = conn.execute(
-                """
-                SELECT order_id, idempotency_key, slug, token_id, price, size, created_at
-                FROM orders
-                WHERE status='PENDING' AND type='LIMIT'
-                ORDER BY created_at DESC
-                """
-            ).fetchall()
-        finally:
-            conn.close()
+        # fetch_open_orders() returns None on API error (Phase 2) --
+        # distinct from an empty list ("confirmed no live orders"). On
+        # None we can't confirm any DB row against the exchange, so every
+        # PENDING LIMIT row is rehydrated but flagged unverified=True;
+        # requote_check re-verifies each tick instead of dropping them
+        # (dropping would silently stop managing a live order).
+        api_unavailable = live is None
+        live_by_id = {} if api_unavailable else {
+            o["order_id"]: o for o in live if o.get("order_id")
+        }
+        if api_unavailable:
+            logger.warning(
+                "rehydrate_resting: fetch_open_orders failed — "
+                "keeping DB rows unverified, will re-verify on requote tick"
+            )
 
         count = 0
         for row in rows:
@@ -109,7 +153,7 @@ class OrderManager:
             if order_id.startswith("SIM-") or order_id.startswith("FAKE-"):
                 continue  # paper-mode simulated; never live
             token_id = row["token_id"]
-            if order_id not in live_by_id:
+            if not api_unavailable and order_id not in live_by_id:
                 continue  # not live — left to the reconciler's mark_vanished path
             if token_id in self._resting:
                 # Rows are created_at DESC: newest PENDING limit per token wins.
@@ -127,6 +171,7 @@ class OrderManager:
                 placed_at=time.monotonic(),
                 ttl_s=self._cfg.orders.limit_ttl_s,
                 mid=price,  # book may not be loaded yet; requote loop recomputes
+                unverified=api_unavailable,
             )
             count += 1
 
@@ -155,7 +200,7 @@ class OrderManager:
             # TOCTOU breaker check (may have tripped between strategy
             # filter pass and lock acquisition)
             if self._risk and self._risk.breaker_tripped:
-                log_rejected(slug, token_id, "circuit_breaker_toctou", filters)
+                _log_rejected(slug, token_id, "circuit_breaker_toctou", filters)
                 return
 
             ask = book.best_ask
@@ -195,62 +240,38 @@ class OrderManager:
         result = await self._provider.async_place_order(
             token_id, "BUY", price, size, "MARKET"
         )
-        if not result.get("success"):
-            # Check for server-side duplicate
-            error_msg = result.get("error", "")
-            from execution.idempotency import is_duplicate_error
-            if is_duplicate_error(error_msg):
-                # Recover real order_id from open orders
-                recovered = self._provider.find_order_by_params(
-                    token_id, "BUY", size
-                )
-                if recovered and recovered.get("order_id"):
-                    real_id = recovered["order_id"]
-                    self._save_order(
-                        real_id, idem_key, slug, token_id, price, size, "MARKET",
-                        status="PENDING",
-                    )
-                    log_entered(slug, token_id, filters, real_id, idem_key)
-                    logger.info(
-                        f"Market order (duplicate): {slug} recovered as {real_id}"
-                    )
-                    return
-                # Fall through — store as UNKNOWN
-                order_id = idem_key
-                self._save_order(
-                    order_id, idem_key, slug, token_id, price, size, "MARKET",
-                    status="UNKNOWN",
-                )
-                log_entered(slug, token_id, filters, order_id, idem_key)
-                logger.info(
-                    f"Market order (duplicate, unrecovered): {slug} -> UNKNOWN"
-                )
-                return
 
-            logger.error(f"Market order failed for {slug}: {result.get('error')}")
-            from infra import telegram
-            telegram.fire(telegram.alert_exchange_rejection(slug, result.get("error", "")))
+        if result.status == "DUPLICATE":
+            self._handle_duplicate(
+                slug, token_id, "BUY", price, size, "MARKET", idem_key, filters,
+            )
             return
 
-        order_id = result.get("order_id")
-        is_simulated = result.get("simulated", False)
+        if result.status == "REJECTED":
+            logger.error(f"Market order failed for {slug}: {result.error}")
+            from infra import telegram
+            telegram.fire(telegram.alert_exchange_rejection(slug, result.error or ""))
+            return
+
+        order_id = result.order_id
 
         # Gate position insert: only when we have a real order_id
         if order_id is not None:
             # Paper mode has no exchange to fill against and the reconciler
             # skips SIM- orders, so a PENDING row would stay PENDING forever.
-            # A simulated market order is an instant fill by definition.
-            self._save_order(
+            # A simulated market order is an instant fill by definition
+            # (PaperProvider.place_order always returns status=FILLED).
+            # Order status update + position insert are atomic (one
+            # transaction) so a mid-write crash can't leave a FILLED/PENDING
+            # order with no matching position row.
+            self._save_order_and_insert_position(
                 order_id, idem_key, slug, token_id, price, size, "MARKET",
-                status="FILLED" if is_simulated else "PENDING",
+                result.status,  # "FILLED" or "PENDING"
+                actual_notional, market_info,
             )
-            log_entered(slug, token_id, filters, order_id, idem_key)
-            # Immediately insert position row so _has_open_position returns
-            # True on the next tick (closes the 60s reconciler gap).
-            self._insert_position(
-                slug, token_id, price, size, actual_notional,
-                order_id, idem_key, market_info,
-            )
+            _log_entered(slug, token_id, filters, order_id, idem_key)
+            # Position row is now visible to _has_open_position on the next
+            # tick (closes the 60s reconciler gap).
         else:
             # No order_id and not a duplicate → honest API gap
             order_id = idem_key
@@ -258,7 +279,7 @@ class OrderManager:
                 order_id, idem_key, slug, token_id, price, size, "MARKET",
                 status="UNKNOWN",
             )
-            log_entered(slug, token_id, filters, order_id, idem_key)
+            _log_entered(slug, token_id, filters, order_id, idem_key)
             # Do NOT insert position row — we aren't sure the order hit
             # the exchange.
 
@@ -278,33 +299,10 @@ class OrderManager:
         filters: Dict[str, Any],
         market_info=None,  # MarketInfo, for position insert (paper fill only)
     ) -> None:
-        # Paper mode: no matching engine exists to fill limit orders.
-        # Simulate immediate fill so positions track and re-entry is blocked.
-        if self._provider._mode == "paper":
-            price = round(mid, 4)
-            if price <= 0 or price >= 1:
-                price = round(ask, 4)
-            size, actual_notional = compute_shares_and_notional(notional, price)
-            idem_key = make_key(slug, token_id, "BUY", price, size, "paper_fill")
-            if is_already_submitted(idem_key):
-                return
-            order_id = idem_key  # no real order ID in paper mode
-            self._save_order(order_id, idem_key, slug, token_id, price, size, "LIMIT",
-                             status="FILLED")
-            log_entered(slug, token_id, filters, order_id, idem_key)
-            self._insert_position(
-                slug, token_id, price, size, actual_notional,
-                order_id, idem_key, market_info,
-            )
-            logger.info(
-                f"[PAPER] Simulated fill: {slug} {size:.4f}@{price:.4f} -> {order_id}"
-            )
-            return
-
         price = round(mid, 4)
         if price <= 0 or price >= 1:
             price = round(ask, 4)
-        size, _ = compute_shares_and_notional(notional, price)
+        size, actual_notional = compute_shares_and_notional(notional, price)
         idem_key = make_key(slug, token_id, "BUY", price, size, "limit")
         if is_already_submitted(idem_key):
             return
@@ -312,15 +310,41 @@ class OrderManager:
         result = await self._provider.async_place_order(
             token_id, "BUY", price, size, "LIMIT"
         )
-        if not result.get("success"):
-            logger.error(f"Limit order failed for {slug}: {result.get('error')}")
-            from infra import telegram
-            telegram.fire(telegram.alert_exchange_rejection(slug, result.get("error", "")))
+
+        if result.status == "DUPLICATE":
+            self._handle_duplicate(
+                slug, token_id, "BUY", price, size, "LIMIT", idem_key, filters,
+            )
             return
 
-        order_id = result.get("order_id") or idem_key
+        if result.status == "REJECTED":
+            logger.error(f"Limit order failed for {slug}: {result.error}")
+            from infra import telegram
+            telegram.fire(telegram.alert_exchange_rejection(slug, result.error or ""))
+            return
+
+        order_id = result.order_id or idem_key
+
+        if result.status == "FILLED":
+            # Paper mode: instant fill, no resting order to track. Live
+            # limit orders never return FILLED from place_order today
+            # (the API confirms acceptance, not fill), so this path is
+            # paper-only in practice, but the dispatch itself no longer
+            # branches on provider.is_paper.
+            self._save_order_and_insert_position(
+                order_id, idem_key, slug, token_id, price, size, "LIMIT", "FILLED",
+                actual_notional, market_info,
+            )
+            _log_entered(slug, token_id, filters, order_id, idem_key)
+            logger.info(
+                f"Simulated fill: {slug} {size:.4f}@{price:.4f} -> {order_id}"
+            )
+            return
+
+        # PENDING (order_id may be missing -> falls back to idem_key above):
+        # resting limit order to track.
         self._save_order(order_id, idem_key, slug, token_id, price, size, "LIMIT")
-        log_entered(slug, token_id, filters, order_id, idem_key)
+        _log_entered(slug, token_id, filters, order_id, idem_key)
         self._resting[token_id] = RestingOrder(
             order_id=order_id,
             idempotency_key=idem_key,
@@ -335,17 +359,95 @@ class OrderManager:
         )
         logger.info(f"Limit order placed: {slug} {size:.4f}@{price:.4f} -> {order_id}")
 
+    def _handle_duplicate(
+        self,
+        slug: str,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        order_type: str,
+        idem_key: str,
+        filters: Dict[str, Any],
+    ) -> None:
+        """DUPLICATE dispatch: recover the real order_id via
+        find_order_by_params; on failure store as UNKNOWN (no position
+        insert). Shared by _place_market and _place_limit so both the
+        success=false-body duplicate shape and the exception-string
+        duplicate shape (see provider.OrderResult) get the same recovery
+        attempt."""
+        recovered = self._provider.find_order_by_params(token_id, side, size)
+        if recovered and recovered.get("order_id"):
+            real_id = recovered["order_id"]
+            self._save_order(
+                real_id, idem_key, slug, token_id, price, size, order_type,
+                status="PENDING",
+            )
+            _log_entered(slug, token_id, filters, real_id, idem_key)
+            logger.info(f"Order (duplicate): {slug} recovered as {real_id}")
+            return
+        # Fall through — store as UNKNOWN
+        order_id = idem_key
+        self._save_order(
+            order_id, idem_key, slug, token_id, price, size, order_type,
+            status="UNKNOWN",
+        )
+        _log_entered(slug, token_id, filters, order_id, idem_key)
+        logger.info(f"Order (duplicate, unrecovered): {slug} -> UNKNOWN")
+
     # ------------------------------------------------------------------
     # Requote loop (called by main loop periodically)
     # ------------------------------------------------------------------
 
+    async def _reverify_unverified(self) -> None:
+        """Re-check any _resting rows flagged unverified against the live
+        API. Runs once per requote_check tick, before the TTL/band/requote
+        pass, so a confirmed-gone order doesn't get managed as if it were
+        still live and a confirmed-live order stops being retried.
+
+        On a fresh API failure (None again), rows simply stay unverified
+        and are retried next tick -- no change.
+        """
+        async with self._lock:
+            pending_ids = [
+                tid for tid, o in self._resting.items() if o.unverified
+            ]
+        if not pending_ids:
+            return
+
+        live = await self._provider.async_fetch_open_orders()
+        if live is None:
+            return  # still unavailable — retry again next tick
+        live_ids = {o["order_id"] for o in live if o.get("order_id")}
+
+        async with self._lock:
+            for token_id in pending_ids:
+                order = self._resting.get(token_id)
+                if order is None:
+                    continue
+                if order.order_id in live_ids:
+                    order.unverified = False
+                else:
+                    # Confirmed gone — same handling as the reconciler's
+                    # mark_vanished path: pop so re-entry isn't blocked.
+                    self._resting.pop(token_id, None)
+                    self._update_order_status(
+                        order.order_id, "UNKNOWN", "vanished_from_api"
+                    )
+                    logger.info(
+                        f"Unverified resting order {order.order_id[:16]} "
+                        f"confirmed gone on re-verify — marked UNKNOWN"
+                    )
+
     async def requote_check(self, book_store) -> None:
         """Iterate resting orders; cancel-replace if mid moved >= requote threshold."""
-        if self._provider._mode == "paper":
+        if self._provider.is_paper:
             return  # paper mode fills instantly, no resting orders
         cfg = self._cfg
         now = time.monotonic()
         to_cancel: List[str] = []
+
+        await self._reverify_unverified()
 
         async with self._lock:
             for token_id, order in list(self._resting.items()):
@@ -501,7 +603,7 @@ class OrderManager:
         the caller times out stay PENDING in DB and live on-exchange;
         rehydrate_resting recovers them on next boot.
         """
-        if self._provider._mode == "paper":
+        if self._provider.is_paper:
             self._resting.clear()
             return
         async with self._lock:
@@ -532,31 +634,12 @@ class OrderManager:
         await self._provider.async_cancel_all()
         self._resting.clear()
 
-        if self._provider._mode == "paper":
-            from infra.db import get_connection
-            conn = get_connection()
-            try:
-                now = datetime.now(timezone.utc).isoformat()
-                cur = conn.execute(
-                    "UPDATE positions SET status='CLOSED', realized_pnl=0.0, "
-                    "resolved_at=? WHERE status='OPEN'",
-                    (now,),
-                )
-                conn.commit()
-                n = cur.rowcount
-            finally:
-                conn.close()
+        if self._provider.is_paper:
+            n = positions_repo.bulk_close_paper()
             logger.info(f"[PAPER] close_all: closed {n} open position(s)")
             return
 
-        from infra.db import get_connection
-        conn = get_connection()
-        try:
-            rows = conn.execute(
-                "SELECT token_id, size, notional FROM positions WHERE status='OPEN'"
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = positions_repo.open_for_close()
 
         if not rows:
             logger.info("close_all: no open positions")
@@ -611,29 +694,15 @@ class OrderManager:
         order_type: str,
         status: str = "PENDING",
     ) -> None:
-        # Application-level enforcement for existing DBs (CHECK constraint
-        # only applied on CREATE TABLE IF NOT EXISTS for fresh deploys).
-        VALID = frozenset({"PENDING", "FILLED", "CANCELLED", "FAILED", "UNKNOWN"})
-        if status not in VALID:
-            raise ValueError(f"Invalid order status: {status!r}  (valid: {sorted(VALID)})")
-        from infra.db import get_connection
-        now = datetime.now(timezone.utc).isoformat()
-        conn = get_connection()
         try:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO orders
-                  (order_id, idempotency_key, slug, token_id, side, type, price, size,
-                   status, created_at)
-                VALUES (?, ?, ?, ?, 'BUY', ?, ?, ?, ?, ?)
-                """,
-                (order_id, idem_key, slug, token_id, order_type, price, size, status, now),
-            )
-            conn.commit()
+            orders_repo.insert(order_id, idem_key, slug, token_id, price, size, order_type, status=status)
+        except ValueError:
+            # Application-level status validation (OrdersRepo.insert) --
+            # this is a programming error, not a DB fault; let it propagate
+            # as before (original _save_order raised before its try/except).
+            raise
         except Exception as e:
             logger.error(f"_save_order: {e}")
-        finally:
-            conn.close()
 
     def _insert_position(
         self,
@@ -656,6 +725,23 @@ class OrderManager:
         fills onto the single id f"{user}::0" (P3/D6) — token_id is unique
         per market+outcome, so fall back to that instead.
         """
+        row = self._position_row(slug, token_id, price, size, notional, order_id, decision_id, market_info)
+        try:
+            positions_repo.insert_open(row)
+        except Exception as e:
+            logger.error(f"_insert_position: {e}")
+
+    @staticmethod
+    def _position_row(
+        slug: str,
+        token_id: str,
+        price: float,
+        size: float,
+        notional: float,
+        order_id: str,
+        decision_id: str,
+        market_info,
+    ) -> Dict[str, Any]:
         import os
         user = os.getenv("POLYMARKET_USER_ADDRESS", "")
         if market_info:
@@ -663,27 +749,48 @@ class OrderManager:
         else:
             position_id = f"{user}:{token_id}:0"
         cid = market_info.condition_id if market_info else ""
-
-        from infra.db import get_connection
         now = datetime.now(timezone.utc).isoformat()
-        conn = get_connection()
+        return {
+            "position_id": position_id,
+            "slug": slug,
+            "condition_id": cid,
+            "token_id": token_id,
+            "entry_price": price,
+            "size": size,
+            "notional": notional,
+            "opened_at": now,
+            "entry_order_id": order_id,
+            "entry_decision_id": decision_id,
+        }
+
+    def _save_order_and_insert_position(
+        self,
+        order_id: str,
+        idem_key: str,
+        slug: str,
+        token_id: str,
+        price: float,
+        size: float,
+        order_type: str,
+        status: str,
+        notional: float,
+        market_info,
+    ) -> None:
+        """Atomically record a fill: order status update + position insert
+        in one transaction (Phase 1 of the architecture refactor -- was
+        two separate connections/commits, leaving a window where an order
+        could be marked FILLED/PENDING with no matching position row if
+        the process died between the two writes)."""
+        row = self._position_row(slug, token_id, price, size, notional, order_id, idem_key, market_info)
         try:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO positions
-                  (position_id, slug, condition_id, token_id, outcome,
-                   entry_price, size, notional, status, opened_at, source,
-                   entry_order_id, entry_decision_id)
-                VALUES (?, ?, ?, ?, 'No', ?, ?, ?, 'OPEN', ?, 'ENGINE_FILL', ?, ?)
-                """,
-                (position_id, slug, cid, token_id, price, size, notional, now,
-                 order_id, decision_id),
-            )
-            conn.commit()
+            with db.transaction() as conn:
+                orders_repo.insert(
+                    order_id, idem_key, slug, token_id, price, size, order_type,
+                    status=status, conn=conn,
+                )
+                positions_repo.insert_open(row, conn=conn)
         except Exception as e:
-            logger.error(f"_insert_position: {e}")
-        finally:
-            conn.close()
+            logger.error(f"_save_order_and_insert_position: {e}")
 
     def _update_order_status(
         self,
@@ -691,13 +798,4 @@ class OrderManager:
         status: str,
         cancel_reason: Optional[str],
     ) -> None:
-        from infra.db import get_connection
-        conn = get_connection()
-        try:
-            conn.execute(
-                "UPDATE orders SET status=?, cancel_reason=? WHERE order_id=?",
-                (status, cancel_reason, order_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        orders_repo.update_status(order_id, status, cancel_reason)

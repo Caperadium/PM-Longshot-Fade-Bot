@@ -14,7 +14,7 @@ import json
 import logging
 from typing import Optional
 
-from infra.db import get_connection
+from persistence.repos import orders_repo
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +39,11 @@ def make_key(
 
 def is_already_submitted(key: str) -> bool:
     """True if this key exists in orders table with a non-failed status."""
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT status FROM orders WHERE idempotency_key = ?", (key,)
-        ).fetchone()
-        if row is None:
-            return False
-        # If previously failed/cancelled, allow retry
-        return row["status"] not in ("FAILED", "CANCELLED")
-    finally:
-        conn.close()
+    row = orders_repo.by_idem_key(key)
+    if row is None:
+        return False
+    # If previously failed/cancelled, allow retry
+    return row["status"] not in ("FAILED", "CANCELLED")
 
 
 def is_duplicate_error(error_msg: str) -> bool:

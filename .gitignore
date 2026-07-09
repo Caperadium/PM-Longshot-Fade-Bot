@@ -33,3 +33,6 @@ error.md
 # OS files
 Thumbs.db
 .DS_Store
+
+# Temporary artifacts (reviews, plans, scratch) — per CLAUDE.md
+temp/

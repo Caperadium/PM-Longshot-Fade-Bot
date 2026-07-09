@@ -8,12 +8,19 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
-from infra.db import get_connection
+from persistence.repos import breaker_repo
 
 logger = logging.getLogger(__name__)
+
+# breaker_tripped memo TTL. The DB row is the single source of truth
+# (Phase 3, Single-owner state); this just bounds the SELECT rate for a
+# property three hot call sites (risk.allow_entry, order_manager's TOCTOU
+# check, state_publisher's 2s snapshot) read every tick.
+_BREAKER_MEMO_TTL_S = 1.0
 
 
 def _safe_fire_alert(coro) -> None:
@@ -45,9 +52,14 @@ class RiskManager:
         self._per_market_pct = per_market_cap_pct
         self._matic_min_balance = matic_min_balance
         self._matic_balance: float = 0.0
-        self._breaker_tripped = False
-        self._tripped_day: Optional[str] = None
         self._last_matic_alert_ts: float = 0.0
+        # breaker_tripped read-through memo (<=1s stale). No in-memory
+        # trip flag: the circuit_breaker DB row (keyed by UTC day) is the
+        # only source of truth, so a restart or a second RiskManager
+        # instance sees the same tripped state without any resync step.
+        self._breaker_memo: Optional[bool] = None
+        self._breaker_memo_day: Optional[str] = None
+        self._breaker_memo_ts: float = 0.0
 
     def update_params(
         self,
@@ -67,18 +79,37 @@ class RiskManager:
 
     @property
     def breaker_tripped(self) -> bool:
-        # Daily breaker: auto-clears at UTC midnight. The DB row is keyed by
-        # day so a new day starts untripped; this clears the sticky in-memory
-        # flag to match (previously it persisted until manual reset/restart).
+        """Read-through to the circuit_breaker DB row for today (UTC),
+        memoized for up to _BREAKER_MEMO_TTL_S.
+
+        Stays a property (not a method) deliberately: three call sites
+        read it as a bare attribute -- RiskManager.allow_entry (below),
+        OrderManager's TOCTOU check (order_manager.py), and
+        StatePublisher's engine_state snapshot. A DB row keyed by day
+        means a new day starts untripped with no explicit reset step, and
+        a trip recorded by one RiskManager instance (or a prior process)
+        is immediately visible to any other -- there is no sticky
+        in-memory flag to fall out of sync or to explicitly roll over.
+        """
+        day = self.today_utc()
+        now = time.monotonic()
         if (
-            self._breaker_tripped
-            and self._tripped_day
-            and self._tripped_day != self.today_utc()
+            self._breaker_memo is not None
+            and self._breaker_memo_day == day
+            and now - self._breaker_memo_ts < _BREAKER_MEMO_TTL_S
         ):
-            self._breaker_tripped = False
-            self._tripped_day = None
-            logger.info("Circuit breaker auto-reset (UTC day rollover)")
-        return self._breaker_tripped
+            return self._breaker_memo
+        row = breaker_repo.day_state(day)
+        tripped = bool(row["tripped"]) if row is not None else False
+        self._breaker_memo = tripped
+        self._breaker_memo_day = day
+        self._breaker_memo_ts = now
+        return tripped
+
+    def _invalidate_breaker_memo(self) -> None:
+        self._breaker_memo = None
+        self._breaker_memo_day = None
+        self._breaker_memo_ts = 0.0
 
     # ------------------------------------------------------------------
     # Breaker
@@ -97,46 +128,8 @@ class RiskManager:
         and closed internally.
         """
         day = self.today_utc()
-        own_conn = conn is None
-        if own_conn:
-            conn = get_connection()
-        try:
-            conn.execute(
-                """
-                INSERT INTO circuit_breaker (day, realized_pnl)
-                VALUES (?, ?)
-                ON CONFLICT(day) DO UPDATE SET
-                    realized_pnl = realized_pnl + excluded.realized_pnl
-                """,
-                (day, pnl_delta),
-            )
-            if own_conn:
-                conn.commit()
-        finally:
-            if own_conn:
-                conn.close()
-        self._check_breaker(day)
-
-    def _check_breaker(self, day: str) -> None:
-        conn = get_connection()
-        try:
-            row = conn.execute(
-                "SELECT realized_pnl, tripped FROM circuit_breaker WHERE day = ?",
-                (day,),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None:
-            return
-        pnl = row["realized_pnl"]
-        if row["tripped"]:
-            self._breaker_tripped = True
-            self._tripped_day = day
-            return
-        # We need cash bankroll to compute %; caller must check allow_entry() which
-        # uses the last-known bankroll from engine state. Here we just mark.
-        # The actual % check is done in allow_entry().
-        self._breaker_tripped = bool(row["tripped"])
+        breaker_repo.record_pnl_event(day, pnl_delta, conn=conn)
+        self._invalidate_breaker_memo()
 
     def check_breaker_against_bankroll(self, cash_bankroll: float) -> bool:
         """
@@ -146,19 +139,10 @@ class RiskManager:
         if cash_bankroll <= 0:
             return False
         day = self.today_utc()
-        conn = get_connection()
-        try:
-            row = conn.execute(
-                "SELECT realized_pnl, tripped FROM circuit_breaker WHERE day = ?",
-                (day,),
-            ).fetchone()
-        finally:
-            conn.close()
+        row = breaker_repo.day_state(day)
         if row is None:
             return False
         if row["tripped"]:
-            self._breaker_tripped = True
-            self._tripped_day = day
             return True
         pnl = row["realized_pnl"]
         loss_pct = (-pnl / cash_bankroll) * 100 if pnl < 0 else 0.0
@@ -168,44 +152,16 @@ class RiskManager:
         return False
 
     def _trip(self, day: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        conn = get_connection()
-        try:
-            conn.execute(
-                """
-                INSERT INTO circuit_breaker (day, tripped, tripped_at)
-                VALUES (?, 1, ?)
-                ON CONFLICT(day) DO UPDATE SET tripped=1, tripped_at=excluded.tripped_at
-                """,
-                (day, now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        self._breaker_tripped = True
-        self._tripped_day = day
+        breaker_repo.trip(day)
+        self._invalidate_breaker_memo()
         logger.error(f"Circuit breaker TRIPPED for {day}")
         from infra import telegram
         _safe_fire_alert(telegram.alert_breaker_tripped(self._daily_loss_pct, day))
 
     def reset_breaker(self) -> None:
         day = self.today_utc()
-        now = datetime.now(timezone.utc).isoformat()
-        conn = get_connection()
-        try:
-            conn.execute(
-                """
-                INSERT INTO circuit_breaker (day, tripped, reset_at)
-                VALUES (?, 0, ?)
-                ON CONFLICT(day) DO UPDATE SET tripped=0, reset_at=excluded.reset_at
-                """,
-                (day, now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        self._breaker_tripped = False
-        self._tripped_day = None
+        breaker_repo.reset(day)
+        self._invalidate_breaker_memo()
         logger.info(f"Circuit breaker reset for {day}")
 
     # ------------------------------------------------------------------
@@ -228,7 +184,7 @@ class RiskManager:
           3. Market deployed + order <= per_market_cap_pct of cash.
         """
         # MATIC gate removed — CLOB orders are off-chain signed messages, no gas needed.
-        if self.breaker_tripped:  # property: handles UTC day rollover
+        if self.breaker_tripped:  # property: DB read-through, memoized <=1s
             return False, "circuit_breaker_tripped"
         if cash_bankroll <= 0:
             return False, "zero_bankroll"
@@ -261,23 +217,3 @@ class RiskManager:
                 f"New entries halted."
             )
         )
-
-
-def get_open_notional() -> Tuple[float, Dict[str, float]]:
-    """
-    Return (total_deployed, {slug: deployed}) from open positions table.
-    """
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT slug, notional FROM positions WHERE status='OPEN'"
-        ).fetchall()
-    finally:
-        conn.close()
-    total = 0.0
-    by_slug: Dict[str, float] = {}
-    for row in rows:
-        n = float(row["notional"])
-        total += n
-        by_slug[row["slug"]] = by_slug.get(row["slug"], 0.0) + n
-    return total, by_slug

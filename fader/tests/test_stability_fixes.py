@@ -265,6 +265,120 @@ class TestResyncConcurrency(unittest.TestCase):
 
 
 # =========================================================================
+# Phase 6, item 4: _handle_message dispatch dict + _sync_book() helper.
+# Equivalence tests -- same per-event-type behavior as the old if/elif chain.
+# =========================================================================
+
+class TestHandleMessageDispatch(unittest.IsolatedAsyncioTestCase):
+    def _make_ws(self):
+        from marketdata.ws_client import WsClient
+
+        book_store = MagicMock()
+        staleness = MagicMock()
+        ws = WsClient(book_store=book_store, staleness=staleness)
+        return ws, book_store, staleness
+
+    async def test_dispatch_table_covers_all_known_event_types(self):
+        ws, _, _ = self._make_ws()
+        for etype in (
+            "book", "price_change", "last_trade_price", "best_bid_ask",
+            "new_market", "market_resolved", "tick_size_change",
+        ):
+            self.assertIn(etype, ws._dispatch)
+
+    async def test_unknown_event_type_is_noop(self):
+        ws, book_store, staleness = self._make_ws()
+        await ws._handle_message('[{"event_type": "unknown_thing"}]')
+        book_store.snapshot.assert_not_called()
+        staleness.touch.assert_not_called()
+
+    async def test_book_event_snapshots_and_syncs(self):
+        ws, book_store, staleness = self._make_ws()
+        fake_book = MagicMock()
+        book_store.get.return_value = fake_book
+        msg = (
+            '[{"event_type": "book", "asset_id": "tok1", '
+            '"bids": [], "asks": []}]'
+        )
+        await ws._handle_message(msg)
+        book_store.snapshot.assert_called_once_with("tok1", [], [])
+        staleness.touch.assert_called_once_with("tok1")
+        fake_book.update_band_tracker.assert_called_once_with(
+            ws._band_low, ws._band_high
+        )
+
+    async def test_book_event_missing_asset_id_is_noop(self):
+        ws, book_store, staleness = self._make_ws()
+        await ws._handle_message('[{"event_type": "book"}]')
+        book_store.snapshot.assert_not_called()
+        staleness.touch.assert_not_called()
+
+    async def test_price_change_event_deltas_and_syncs(self):
+        ws, book_store, staleness = self._make_ws()
+        fake_book = MagicMock()
+        book_store.get.return_value = fake_book
+        msg = (
+            '[{"event_type": "price_change", "asset_id": "tok2", '
+            '"changes": [{"side": "SELL", "price": "0.9", "size": "10"}]}]'
+        )
+        await ws._handle_message(msg)
+        book_store.delta.assert_called_once_with("tok2", "SELL", "0.9", "10")
+        staleness.touch.assert_called_once_with("tok2")
+        fake_book.update_band_tracker.assert_called_once_with(
+            ws._band_low, ws._band_high
+        )
+
+    async def test_last_trade_price_touches_staleness_only(self):
+        ws, book_store, staleness = self._make_ws()
+        await ws._handle_message(
+            '[{"event_type": "last_trade_price", "asset_id": "tok3"}]'
+        )
+        staleness.touch.assert_called_once_with("tok3")
+        book_store.snapshot.assert_not_called()
+        book_store.delta.assert_not_called()
+
+    async def test_best_bid_ask_touches_staleness_only(self):
+        ws, book_store, staleness = self._make_ws()
+        await ws._handle_message(
+            '[{"event_type": "best_bid_ask", "asset_id": "tok4"}]'
+        )
+        staleness.touch.assert_called_once_with("tok4")
+
+    async def test_new_market_dispatches_to_callback(self):
+        from marketdata.ws_client import WsClient
+
+        cb = AsyncMock()
+        ws = WsClient(
+            book_store=MagicMock(), staleness=MagicMock(), new_market_cb=cb,
+        )
+        await ws._handle_message('[{"event_type": "new_market", "slug": "x"}]')
+        await asyncio.sleep(0)  # let the fire-and-forget task run
+        cb.assert_called_once()
+
+    async def test_market_resolved_dispatches_to_callback(self):
+        from marketdata.ws_client import WsClient
+
+        cb = AsyncMock()
+        ws = WsClient(
+            book_store=MagicMock(), staleness=MagicMock(), market_resolved_cb=cb,
+        )
+        await ws._handle_message(
+            '[{"event_type": "market_resolved", "asset_id": "tokX"}]'
+        )
+        await asyncio.sleep(0)
+        cb.assert_called_once()
+
+    async def test_pong_text_frame_updates_last_pong_and_skips_dispatch(self):
+        ws, book_store, staleness = self._make_ws()
+        before = ws._last_pong_ts
+        await asyncio.sleep(0.01)
+        await ws._handle_message("PONG")
+        self.assertGreater(ws._last_pong_ts, before)
+        book_store.snapshot.assert_not_called()
+        staleness.touch.assert_not_called()
+
+
+# =========================================================================
 # FIX 3: rehydrate_resting
 # =========================================================================
 
@@ -306,7 +420,7 @@ class TestRehydrateResting(unittest.IsolatedAsyncioTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_fetch_open_orders = AsyncMock(return_value=[
             {"order_id": "live-order-1", "token_id": "0xTOKEN", "status": "LIVE"}
         ])
@@ -331,7 +445,7 @@ class TestRehydrateResting(unittest.IsolatedAsyncioTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_fetch_open_orders = AsyncMock(return_value=[])
 
         om = OrderManager(cfg=cfg, provider=provider)
@@ -349,7 +463,7 @@ class TestRehydrateResting(unittest.IsolatedAsyncioTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_fetch_open_orders = AsyncMock(return_value=[
             {"order_id": "SIM-12345", "token_id": "0xTOKEN3", "status": "LIVE"},
             {"order_id": "FAKE-999", "token_id": "0xTOKEN4", "status": "LIVE"},
@@ -377,7 +491,7 @@ class TestRehydrateResting(unittest.IsolatedAsyncioTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_fetch_open_orders = AsyncMock(return_value=[
             {"order_id": "old-order", "token_id": "0xTOKEN5", "status": "LIVE"},
             {"order_id": "new-order", "token_id": "0xTOKEN5", "status": "LIVE"},
@@ -395,13 +509,212 @@ class TestRehydrateResting(unittest.IsolatedAsyncioTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         provider.async_fetch_open_orders = AsyncMock()
 
         om = OrderManager(cfg=cfg, provider=provider)
         count = await om.rehydrate_resting()
 
         self.assertEqual(count, 0)
+        provider.async_fetch_open_orders.assert_not_called()
+
+    async def test_rehydrate_paper_mode_still_reads_db(self):
+        """Paper mode: DB read only, no API verify. PaperProvider never
+        creates a PENDING LIMIT row (place_order always returns FILLED),
+        so this is a no-op in practice, but the DB read itself must still
+        run -- a stray PENDING LIMIT row left over from a mode switch is
+        not silently ignored, and a DB read failure is still fatal even
+        in paper mode (see test_rehydrate_db_read_failure_alerts_and_raises)."""
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+        import persistence.repos as repos_mod
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = True
+        provider.async_fetch_open_orders = AsyncMock()
+
+        om = OrderManager(cfg=cfg, provider=provider)
+        with patch.object(
+            repos_mod.orders_repo, "pending_limit_orders", wraps=repos_mod.orders_repo.pending_limit_orders,
+        ) as read_mock:
+            count = await om.rehydrate_resting()
+
+        read_mock.assert_called_once()
+        self.assertEqual(count, 0)
+        provider.async_fetch_open_orders.assert_not_called()
+
+    async def test_rehydrate_api_none_keeps_rows_unverified(self):
+        """fetch_open_orders() -> None means API unavailable, not "no
+        orders". Every DB PENDING LIMIT row must be rehydrated (not
+        dropped) and flagged unverified=True."""
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+
+        self._insert_pending_limit("live-order-2", "0xTOKEN6")
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=None)
+
+        om = OrderManager(cfg=cfg, provider=provider)
+        count = await om.rehydrate_resting()
+
+        self.assertEqual(count, 1)
+        self.assertIn("0xTOKEN6", om._resting)
+        self.assertTrue(om._resting["0xTOKEN6"].unverified)
+
+    async def test_rehydrate_db_read_failure_alerts_and_raises(self):
+        """A DB read failure (not an API failure) is fatal at startup:
+        fire a telegram alert, then re-raise so main.py aborts."""
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+        import persistence.repos as repos_mod
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=[])
+
+        om = OrderManager(cfg=cfg, provider=provider)
+
+        with patch.object(
+            repos_mod.orders_repo, "pending_limit_orders",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch("infra.telegram.alert_error", new=AsyncMock()) as alert_mock:
+            with self.assertRaises(sqlite3.OperationalError):
+                await om.rehydrate_resting()
+
+        alert_mock.assert_awaited_once()
+        provider.async_fetch_open_orders.assert_not_called()
+
+    async def test_rehydrate_db_read_failure_alerts_and_raises_in_paper_mode(self):
+        """The DB-read-failure-aborts-startup rule applies in paper mode
+        too -- the DB read now runs before the is_paper check."""
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+        import persistence.repos as repos_mod
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = True
+        provider.async_fetch_open_orders = AsyncMock()
+
+        om = OrderManager(cfg=cfg, provider=provider)
+
+        with patch.object(
+            repos_mod.orders_repo, "pending_limit_orders",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch("infra.telegram.alert_error", new=AsyncMock()) as alert_mock:
+            with self.assertRaises(sqlite3.OperationalError):
+                await om.rehydrate_resting()
+
+        alert_mock.assert_awaited_once()
+        provider.async_fetch_open_orders.assert_not_called()
+
+
+class TestReverifyUnverifiedResting(unittest.IsolatedAsyncioTestCase):
+    """requote_check re-verifies unverified resting orders against the
+    live API each tick instead of trusting or dropping them blindly."""
+
+    async def asyncSetUp(self):
+        os.environ["POLYMARKET_USER_ADDRESS"] = "0xTEST_USER"
+        self.db_path = _FADER_ROOT / "tests" / "test_fader_reverify.db"
+        from infra.db import set_db_path, init_db
+        set_db_path(self.db_path)
+        if self.db_path.exists():
+            self.db_path.unlink()
+        init_db()
+
+    async def asyncTearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def _make_resting(self, token_id, order_id, unverified=True):
+        from execution.order_manager import RestingOrder
+        return RestingOrder(
+            order_id=order_id, idempotency_key=f"ik-{order_id}", slug="s",
+            token_id=token_id, price=0.85, size=10.0, notional=8.5,
+            placed_at=time.monotonic(), ttl_s=300, mid=0.85,
+            unverified=unverified,
+        )
+
+    async def test_reverify_clears_flag_when_confirmed_live(self):
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=[
+            {"order_id": "o-1", "token_id": "0xA", "status": "LIVE"},
+        ])
+
+        om = OrderManager(cfg=cfg, provider=provider)
+        om._resting["0xA"] = self._make_resting("0xA", "o-1")
+
+        book_store = MagicMock()
+        book_store.get.return_value = None  # skip the rest of requote_check
+        await om.requote_check(book_store)
+
+        self.assertIn("0xA", om._resting)
+        self.assertFalse(om._resting["0xA"].unverified)
+
+    async def test_reverify_drops_order_confirmed_gone(self):
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=[])
+
+        om = OrderManager(cfg=cfg, provider=provider)
+        om._resting["0xB"] = self._make_resting("0xB", "o-2")
+
+        book_store = MagicMock()
+        book_store.get.return_value = None
+        await om.requote_check(book_store)
+
+        self.assertNotIn("0xB", om._resting)
+
+    async def test_reverify_stays_unverified_on_repeat_api_failure(self):
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=None)
+
+        om = OrderManager(cfg=cfg, provider=provider)
+        om._resting["0xC"] = self._make_resting("0xC", "o-3")
+
+        book_store = MagicMock()
+        book_store.get.return_value = None
+        await om.requote_check(book_store)
+
+        self.assertIn("0xC", om._resting)
+        self.assertTrue(om._resting["0xC"].unverified)
+
+    async def test_reverify_skipped_when_no_unverified_orders(self):
+        """No wasted API call when every resting order is already verified."""
+        from execution.order_manager import OrderManager
+        from config.config_loader import load_config
+
+        cfg = load_config()
+        provider = MagicMock()
+        provider.is_paper = False
+        provider.async_fetch_open_orders = AsyncMock(return_value=[])
+
+        om = OrderManager(cfg=cfg, provider=provider)
+        om._resting["0xD"] = self._make_resting("0xD", "o-4", unverified=False)
+
+        book_store = MagicMock()
+        book_store.get.return_value = None
+        await om.requote_check(book_store)
+
         provider.async_fetch_open_orders.assert_not_called()
 
 
@@ -437,7 +750,7 @@ class TestCancelAllResting(unittest.IsolatedAsyncioTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "paper"
+        provider.is_paper = True
         provider.async_cancel_order = AsyncMock()
 
         om = OrderManager(cfg=cfg, provider=provider)
@@ -454,7 +767,7 @@ class TestCancelAllResting(unittest.IsolatedAsyncioTestCase):
 
         cfg = load_config()
         provider = MagicMock()
-        provider._mode = "live"
+        provider.is_paper = False
         provider.async_cancel_order = AsyncMock(return_value={"success": True})
 
         om = OrderManager(cfg=cfg, provider=provider)

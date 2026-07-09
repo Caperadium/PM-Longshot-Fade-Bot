@@ -264,6 +264,21 @@ class TestNoneOrderIdHandling(unittest.TestCase):
 class TestMaticBalanceCheck(unittest.TestCase):
     """MATIC gate must reject entries when balance below threshold."""
 
+    def setUp(self):
+        # allow_entry() reads RiskManager.breaker_tripped, which is now a
+        # DB read-through (Phase 3) -- needs the circuit_breaker table.
+        db_path = _FADER_ROOT / "tests" / "test_fader_matic.db"
+        from infra.db import set_db_path, init_db
+        set_db_path(db_path)
+        if db_path.exists():
+            db_path.unlink()
+        init_db()
+
+    def tearDown(self):
+        db_path = _FADER_ROOT / "tests" / "test_fader_matic.db"
+        if db_path.exists():
+            db_path.unlink()
+
     def test_allow_entry_permits_on_sufficient_matic(self):
         from engine.risk import RiskManager
 
@@ -788,8 +803,10 @@ class TestOrderLifecycle(unittest.TestCase):
         self.assertEqual(count, 1, "Must have exactly 1 OPEN row — ENGINE_FILL + RECONCILE_IMPORT must deduplicate")
 
     def test_get_open_notional_counts_once(self):
-        """get_open_notional() must count ENGINE_FILL position exactly once."""
-        from engine.risk import get_open_notional
+        """PositionsRepo.deployed_total() must count ENGINE_FILL position
+        exactly once (Phase 2: engine.risk.get_open_notional was a thin
+        delegate, deleted in favor of calling the repo directly)."""
+        from persistence.repos import positions_repo
         from infra.db import get_connection
 
         position_id = "0xTEST_USER:0xCOND:2"
@@ -809,8 +826,8 @@ class TestOrderLifecycle(unittest.TestCase):
         finally:
             conn.close()
 
-        total, by_slug = get_open_notional()
-        self.assertEqual(total, 9.00, "get_open_notional must report correct total")
+        total, by_slug = positions_repo.deployed_total()
+        self.assertEqual(total, 9.00, "deployed_total must report correct total")
         self.assertEqual(by_slug["s"], 9.00)
 
     def test_close_all_position_cleanup(self):

@@ -14,6 +14,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from config.config_loader import AppConfig
+from engine.registry import MarketRegistry
+from persistence.repos import control_repo, decisions_repo
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +26,14 @@ class Pollers:
         cfg: AppConfig,
         reconciler,
         ws_client,
-        token_map: Dict[str, Any],
+        registry: MarketRegistry,
         slugs_changed_cb: Optional[Callable] = None,
         order_manager=None,
     ) -> None:
         self._cfg = cfg
         self._reconciler = reconciler
         self._ws = ws_client
-        self._token_map = token_map
+        self._registry = registry
         self._slugs_changed_cb = slugs_changed_cb
         self._order_manager = order_manager
         self._tasks: List[asyncio.Task] = []
@@ -56,7 +58,7 @@ class Pollers:
                 risk = self._reconciler._risk
                 provider = self._reconciler._provider
                 try:
-                    if provider._mode != "paper":
+                    if not provider.is_paper:
                         allowance = await provider.async_fetch_usdc_allowance()
                         if allowance < 1.0:
                             logger.warning(f"USDC.e allowance low: {allowance:.2f}")
@@ -101,16 +103,8 @@ class Pollers:
 
     @staticmethod
     def _prune_old_rows(retention_days: int = 14) -> None:
-        from infra.db import execute_write
-        cutoff = f"-{retention_days} days"
-        n1 = execute_write(
-            "DELETE FROM decisions WHERE ts < datetime('now', ?)", (cutoff,)
-        )
-        n2 = execute_write(
-            "DELETE FROM control_commands WHERE status != 'PENDING' "
-            "AND ts < datetime('now', ?)",
-            (cutoff,),
-        )
+        n1 = decisions_repo.prune(retention_days)
+        n2 = control_repo.prune(retention_days)
         if n1 or n2:
             logger.info(
                 f"DB retention prune: {n1} decisions, {n2} control_commands "
@@ -134,9 +128,9 @@ class Pollers:
 
         for rung in new_rungs:
             slug = rung["slug"]
-            if slug in self._token_map:
+            if slug in self._registry:
                 continue
-            self._token_map[slug] = MarketInfo(
+            self._registry.add(slug, MarketInfo(
                 slug=slug,
                 condition_id=rung.get("condition_id", ""),
                 token_id=rung["token_id"],
@@ -146,7 +140,7 @@ class Pollers:
                 end_date_iso=rung.get("end_date_iso", ""),
                 active=rung.get("active", True),
                 closed=False,
-            )
+            ))
             await self._ws.subscribe_tokens([rung["token_id"]])
             logger.info(f"Discovered new rung: {slug}")
 
@@ -186,14 +180,14 @@ class Pollers:
             )
 
             for child in new_children:
-                if child["slug"] in self._token_map:
+                if child["slug"] in self._registry:
                     continue
                 if any(
                     mi.token_id == child["token_id"]
-                    for mi in self._token_map.values()
+                    for _, mi in self._registry.active_items()
                 ):
                     continue
-                self._token_map[child["slug"]] = MarketInfo(
+                self._registry.add(child["slug"], MarketInfo(
                     slug=child["slug"],
                     condition_id=child.get("condition_id", "") or child["token_id"],
                     token_id=child["token_id"],
@@ -203,7 +197,7 @@ class Pollers:
                     end_date_iso=child.get("end_date", ""),
                     active=child.get("active", True),
                     closed=bool(child.get("resolution", "")),
-                )
+                ))
                 await self._ws.subscribe_tokens([child["token_id"]])
                 added_all.append(child)
 

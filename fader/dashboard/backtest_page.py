@@ -262,6 +262,7 @@ def render(embedded: bool = True) -> None:
             trades_df,
             n_bootstrap=int(n_bootstrap),
             initial_capital=float(initial_capital),
+            skipped_filters=trades_df.attrs.get("skipped_filters"),
         )
 
         # Universe discrepancy warning (volume / depth filters not applied)

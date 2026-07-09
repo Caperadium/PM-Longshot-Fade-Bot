@@ -22,7 +22,7 @@ import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -36,6 +36,14 @@ logger = logging.getLogger("crypto_sweep")
 
 # Ensure fader/ is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from backtest.harness import HarnessDefaults, load_store  # noqa: E402
+
+# crypto_sweep uses $25 notional per trade (vs the $10 shared default) --
+# this market runs a larger simulated bankroll (INITIAL_CAPITAL=$1000
+# below) than the other CLIs' backtests. Divergence kept explicit here
+# rather than silently baked into harness.py (Phase 5 plan requirement).
+CRYPTO_DEFAULTS = replace(HarnessDefaults(), order_notional_usd=25.0)
 
 # ---------------------------------------------------------------------------
 # Parameter ranges
@@ -61,10 +69,10 @@ WALKFORWARD_WINDOWS = 4
 WALKFORWARD_BOOTSTRAP = 1000
 
 INITIAL_CAPITAL = 1000.0
-ORDER_NOTIONAL = 25.0
+ORDER_NOTIONAL = CRYPTO_DEFAULTS.order_notional_usd  # $25 (see CRYPTO_DEFAULTS comment above)
 MIN_TIME_IN_BAND_DAYS = 1
 SPREAD_C = 1.0
-N_BOOTSTRAP = 5000
+N_BOOTSTRAP = CRYPTO_DEFAULTS.n_bootstrap
 N_WORKERS = 8
 
 # Progress reporting: how often to print from main thread
@@ -174,9 +182,12 @@ def _run_chunk(args):
     where df_json is the market-filtered DataFrame serialized as JSON.
     """
     # Rebuild DataFrame from JSON + import inside worker for clean state
+    # (this is the spawn-safe pattern backtest/harness.py's run_grid copies:
+    # module-level worker fn, df_json serialized and passed INSIDE the
+    # worker's args tuple -- no pool initializer).
     import pandas as pd
-    from backtest.engine import BacktestConfig, run_backtest
-    from backtest.metrics import compute_all_metrics
+    from backtest.engine import BacktestConfig
+    from backtest.harness import run_config
     from execution.sizing import make_sizing_fn
 
     df_json, label, slug_filter, configs_chunk = args
@@ -197,19 +208,12 @@ def _run_chunk(args):
             sizing_fn=sizing_fn,
             n_bootstrap=N_BOOTSTRAP,
         )
-        try:
-            trades_df, _ = run_backtest(market_df, cfg)
-        except Exception:
+        row = run_config(market_df, cfg, initial_capital=INITIAL_CAPITAL)
+        if row.empty:
             continue
 
-        if trades_df.empty:
-            continue
-
-        m = compute_all_metrics(
-            trades_df, n_bootstrap=N_BOOTSTRAP, initial_capital=INITIAL_CAPITAL
-        )
         results.append(
-            _build_result_row(label, slug_filter, band_low, alpha, min_dte, max_dte, m)
+            _build_result_row(label, slug_filter, band_low, alpha, min_dte, max_dte, row.metrics)
         )
 
     return results
@@ -226,51 +230,25 @@ def _run_walkforward_for_top_configs(
 
     No parameter is re-optimized on any window — same config applied to
     every window. Returns per-config stability summaries for the report.
+
+    Phase 5: moved to backtest.harness.window_stability (one of three
+    distinct walk-forward variants -- see harness.py module docstring).
+    This wrapper preserves crypto_sweep's original module-level defaults
+    (WALKFORWARD_WINDOWS, WALKFORWARD_BOOTSTRAP, ORDER_NOTIONAL,
+    INITIAL_CAPITAL, MIN_TIME_IN_BAND_DAYS, SPREAD_C, BAND_HIGH).
     """
-    from backtest.engine import BacktestConfig
-    from backtest.walkforward import partition_calendar_windows, window_summary
-    from execution.sizing import make_sizing_fn
+    from backtest.harness import window_stability
 
-    windows = partition_calendar_windows(market_df, n_windows=WALKFORWARD_WINDOWS)
-    out = []
-    for _, row in df_out.head(top_n).iterrows():
-        band_low = float(row["band_low"])
-        alpha = float(row["alpha"])
-        min_dte = int(row["min_dte"])
-        max_dte = int(row["max_dte"])
-
-        sizing_fn = make_sizing_fn(alpha, band_low, BAND_HIGH)
-        cfg = BacktestConfig(
-            band_low=band_low,
-            band_high=BAND_HIGH,
-            min_dte=min_dte,
-            max_dte=max_dte,
-            min_time_in_band_days=MIN_TIME_IN_BAND_DAYS,
-            order_notional_usd=ORDER_NOTIONAL,
-            spread_c=SPREAD_C,
-            sizing_fn=sizing_fn,
-            n_bootstrap=WALKFORWARD_BOOTSTRAP,
-        )
-        try:
-            per_window, stability = window_summary(
-                windows, cfg,
-                n_bootstrap=WALKFORWARD_BOOTSTRAP,
-                initial_capital=INITIAL_CAPITAL,
-            )
-        except Exception as e:
-            logger.warning(f"walkforward failed for band_low={band_low} alpha={alpha}: {e}")
-            continue
-
-        out.append({
-            "band_low": band_low,
-            "alpha": alpha,
-            "min_dte": min_dte,
-            "max_dte": max_dte,
-            "is_score": row["score"],
-            "per_window": per_window,
-            "stability": stability,
-        })
-    return out
+    return window_stability(
+        df_out, market_df, top_n,
+        n_windows=WALKFORWARD_WINDOWS,
+        n_bootstrap=WALKFORWARD_BOOTSTRAP,
+        order_notional_usd=ORDER_NOTIONAL,
+        initial_capital=INITIAL_CAPITAL,
+        min_time_in_band_days=MIN_TIME_IN_BAND_DAYS,
+        spread_c=SPREAD_C,
+        band_high=BAND_HIGH,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -450,9 +428,10 @@ def write_summary(
         lines.append("---")
         lines.append("")
 
+    from backtest.report import write_report
+
     summary_path = os.path.join(out_dir, "summary.md")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    write_report(summary_path, "", ["\n".join(lines)])
     print(f"\nSummary -> {summary_path}")
 
 
@@ -484,9 +463,7 @@ def main() -> None:
 
     # Load data once
     print("\nLoading historical prices...")
-    from backtest.historical import ContractPriceStore
-    store = ContractPriceStore()
-    df = store.snapshot()
+    df = load_store()
     print(f"  {len(df):,} rows, {df['slug'].nunique()} unique slugs")
 
     # Output directory

@@ -31,13 +31,13 @@ try:
 except ImportError:
     websockets = None  # type: ignore
 
+from config.config_loader import DEFAULT_WS_URL
 from marketdata.book_state import BookStore
 from marketdata.staleness import StalenessTracker
 from marketdata.rest_market import fetch_order_book_snapshot
 
 logger = logging.getLogger(__name__)
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL_S = 10
 PONG_TIMEOUT_S = 25
 FORCE_RECONNECT_S = 90
@@ -58,7 +58,7 @@ class WsClient:
         self,
         book_store: BookStore,
         staleness: StalenessTracker,
-        ws_url: str = WS_URL,
+        ws_url: str = DEFAULT_WS_URL,
         new_market_cb: Optional[Callable] = None,
         market_resolved_cb: Optional[Callable] = None,
         band_low: float = 0.80,
@@ -97,6 +97,10 @@ class WsClient:
         self._pong_timeout_s = PONG_TIMEOUT_S
         self._expect_pong = False
         self._last_pong_ts = time.monotonic()
+
+        # Event-type -> handler dispatch table (Phase 6, item 4). Built once
+        # here since handlers are bound methods on this instance.
+        self._dispatch: Dict[str, Callable[[Dict[str, Any]], None]] = self._build_dispatch()
 
     @property
     def connected(self) -> bool:
@@ -320,6 +324,73 @@ class WsClient:
         self._bg_tasks.add(t)
         t.add_done_callback(self._bg_tasks.discard)
 
+    def _sync_book(self, token_id: str) -> None:
+        """Common tail shared by the "book" (snapshot) and "price_change"
+        (delta) event handlers: mark the contract fresh and refresh its
+        band-entry timer. Extracted (Phase 6, item 4) — the two branches
+        differed only in how they mutated the book itself (snapshot() vs.
+        delta()) before doing exactly this."""
+        self._staleness.touch(token_id)
+        book = self._books.get(token_id)
+        if book:
+            book.update_band_tracker(self._band_low, self._band_high)
+
+    def _on_book(self, event: Dict[str, Any]) -> None:
+        token_id = event.get("asset_id", "")
+        if token_id:
+            self._books.snapshot(
+                token_id,
+                event.get("bids", []),
+                event.get("asks", []),
+            )
+            self._sync_book(token_id)
+
+    def _on_price_change(self, event: Dict[str, Any]) -> None:
+        token_id = event.get("asset_id", "")
+        changes = event.get("changes", [])
+        if token_id:
+            for change in changes:
+                side = change.get("side", "")
+                price = change.get("price", "")
+                size = change.get("size", "0")
+                self._books.delta(token_id, side, price, size)
+            self._sync_book(token_id)
+
+    def _on_last_trade_price(self, event: Dict[str, Any]) -> None:
+        # Feeds backtest limit-fill model; note last trade per token
+        token_id = event.get("asset_id", "")
+        if token_id:
+            self._staleness.touch(token_id)
+
+    def _on_best_bid_ask(self, event: Dict[str, Any]) -> None:
+        token_id = event.get("asset_id", "")
+        if token_id:
+            self._staleness.touch(token_id)
+
+    def _on_new_market(self, event: Dict[str, Any]) -> None:
+        if self._new_market_cb:
+            self._spawn_bg(self._new_market_cb(event))
+
+    def _on_market_resolved(self, event: Dict[str, Any]) -> None:
+        if self._market_resolved_cb:
+            self._spawn_bg(self._market_resolved_cb(event))
+
+    def _on_tick_size_change(self, event: Dict[str, Any]) -> None:
+        logger.debug(f"tick_size_change: {event}")
+
+    # Event-type -> handler dispatch (Phase 6, item 4). Built once per
+    # instance (not a class attribute) since handlers are bound methods.
+    def _build_dispatch(self) -> Dict[str, Callable[[Dict[str, Any]], None]]:
+        return {
+            "book": self._on_book,
+            "price_change": self._on_price_change,
+            "last_trade_price": self._on_last_trade_price,
+            "best_bid_ask": self._on_best_bid_ask,
+            "new_market": self._on_new_market,
+            "market_resolved": self._on_market_resolved,
+            "tick_size_change": self._on_tick_size_change,
+        }
+
     async def _handle_message(self, raw: str) -> None:
         # Application-level PONG (FIX 1a) — Polymarket may reply as plain
         # text rather than a JSON event.
@@ -337,52 +408,6 @@ class WsClient:
 
         for event in events:
             etype = event.get("event_type", "")
-
-            if etype == "book":
-                token_id = event.get("asset_id", "")
-                if token_id:
-                    self._books.snapshot(
-                        token_id,
-                        event.get("bids", []),
-                        event.get("asks", []),
-                    )
-                    self._staleness.touch(token_id)
-                    book = self._books.get(token_id)
-                    if book:
-                        book.update_band_tracker(self._band_low, self._band_high)
-
-            elif etype == "price_change":
-                token_id = event.get("asset_id", "")
-                changes = event.get("changes", [])
-                if token_id:
-                    for change in changes:
-                        side = change.get("side", "")
-                        price = change.get("price", "")
-                        size = change.get("size", "0")
-                        self._books.delta(token_id, side, price, size)
-                    self._staleness.touch(token_id)
-                    book = self._books.get(token_id)
-                    if book:
-                        book.update_band_tracker(self._band_low, self._band_high)
-
-            elif etype == "last_trade_price":
-                # Feeds backtest limit-fill model; note last trade per token
-                token_id = event.get("asset_id", "")
-                if token_id:
-                    self._staleness.touch(token_id)
-
-            elif etype == "best_bid_ask":
-                token_id = event.get("asset_id", "")
-                if token_id:
-                    self._staleness.touch(token_id)
-
-            elif etype == "new_market":
-                if self._new_market_cb:
-                    self._spawn_bg(self._new_market_cb(event))
-
-            elif etype == "market_resolved":
-                if self._market_resolved_cb:
-                    self._spawn_bg(self._market_resolved_cb(event))
-
-            elif etype == "tick_size_change":
-                logger.debug(f"tick_size_change: {event}")
+            handler = self._dispatch.get(etype)
+            if handler:
+                handler(event)

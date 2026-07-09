@@ -22,16 +22,20 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from backtest.engine import BacktestConfig, run_backtest
+from backtest.engine import BacktestConfig
+from backtest.harness import BandCache, build_band_cache, load_store
+from backtest.harness import _lean_metrics_row as _metrics_row
+from backtest.harness import _run_lean
+from backtest.harness import walkforward_lean as _oos_validate_harness
 from backtest.historical import ContractPriceStore
 from backtest.metrics import (
     PERIODS_PER_YEAR,
     calmar_ratio,
-    compute_all_metrics,
     daily_pnl_series,
     max_drawdown_pct,
     sortino_ratio,
 )
+from backtest.report import write_report
 from backtest.walkforward import partition_calendar_windows
 from execution.sizing import make_sizing_fn
 
@@ -66,80 +70,17 @@ class GridPoint:
 
 
 # ---------------------------------------------------------------------------
-# Lean scheme runner (no paired CIs, no per-bin — speed over depth)
+# Lean scheme runner + band cache + OOS validation: moved to
+# backtest/harness.py (Phase 5) as _run_lean, _lean_metrics_row (imported
+# above as _metrics_row), BandCache, build_band_cache, and walkforward_lean
+# (imported above as _oos_validate_harness -- distinct from
+# harness.walkforward_normalized / harness.window_stability; see
+# harness.py's module docstring for why all three variants are kept
+# separate). Thin call-shape wrappers below preserve this module's
+# original defaults (order_notional_usd=10.0, min_time_in_band_days=1,
+# spread_c=1.0) and positional signatures so downstream call sites in
+# this file are unchanged.
 # ---------------------------------------------------------------------------
-
-def _run_lean(
-    df: pd.DataFrame,
-    band_low: float,
-    band_high: float,
-    alpha: float,
-    sizing_fn: Optional[Callable[[float], float]],
-    n_bootstrap: int = 1000,
-) -> Dict:
-    """Run backtest + compute_all_metrics for one scheme. Minimal allocation."""
-    cfg = BacktestConfig(
-        band_low=band_low,
-        band_high=band_high,
-        min_time_in_band_days=1,
-        order_notional_usd=10.0,
-        spread_c=1.0,
-        slippage_c=0.0,
-        adverse_selection_c=0.0,
-        n_bootstrap=n_bootstrap,
-        sizing_fn=sizing_fn,
-    )
-    try:
-        trades_df, _ = run_backtest(df, cfg)
-    except Exception as e:
-        logger.warning(f"band=[{band_low:.2f},{band_high:.2f}] a={alpha:+.2f}: backtest failed: {e}")
-        return {"empty": True, "n_trades": 0}
-
-    if trades_df.empty:
-        return {"empty": True, "n_trades": 0}
-
-    m = compute_all_metrics(trades_df, n_bootstrap=n_bootstrap)
-    return {"empty": False, "trades_df": trades_df, "metrics": m}
-
-
-def _metrics_row(result: Dict) -> Dict:
-    """Extract flat metrics dict from _run_lean result."""
-    if result.get("empty"):
-        return {
-            "n_trades": 0, "sortino": 0.0, "calmar": None,
-            "total_pnl": 0.0, "max_dd_pct": 0.0, "daily_skew": 0.0,
-            "hit_rate": 0.0, "expectancy": 0.0,
-            "n_daily": 0, "n_active_days": 0,
-        }
-    m = result["metrics"]
-    return {
-        "n_trades": m.get("n_trades", 0),
-        "sortino": m.get("sortino", 0.0) or 0.0,
-        "calmar": m.get("calmar"),
-        "total_pnl": m.get("total_pnl", 0.0),
-        "max_dd_pct": m.get("max_drawdown_pct", 0.0),
-        "daily_skew": m.get("daily_skew", 0.0),
-        "hit_rate": m.get("hit_rate", 0.0),
-        "expectancy": m.get("expectancy", 0.0),
-        "n_daily": m.get("n_daily", 0),
-        "n_active_days": m.get("n_active_days", 0),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Per-band baseline cache
-# ---------------------------------------------------------------------------
-
-@dataclass
-class BandCache:
-    band_low: float
-    band_high: float
-    # Full-sample baseline
-    baseline_metrics: Dict
-    # Per-window baseline metrics (for OOS comparison)
-    window_baselines: List[Dict]  # [{label, sortino, total_pnl, ...}, ...]
-    # Calendar windows (df slices for reuse)
-    windows: List[Tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame]]
 
 
 def _build_band_cache(
@@ -149,46 +90,11 @@ def _build_band_cache(
     n_windows: int,
     n_bootstrap: int,
 ) -> BandCache:
-    """Pre-compute baseline (a=0) full-sample and per-window for one band."""
-    t0 = time.perf_counter()
-
-    # Full-sample baseline
-    base_result = _run_lean(df, band_low, band_high, 0.0, None, n_bootstrap)
-    base_metrics = _metrics_row(base_result)
-
-    # Calendar windows
-    windows = partition_calendar_windows(df, n_windows=n_windows)
-    window_baselines: List[Dict] = []
-    for start, end, df_slice in windows:
-        label = f"{start:%Y-%m-%d}..{end:%Y-%m-%d}"
-        if df_slice.empty:
-            window_baselines.append({"label": label, "empty": True})
-            continue
-        w_result = _run_lean(df_slice, band_low, band_high, 0.0, None, n_bootstrap)
-        w_metrics = _metrics_row(w_result)
-        w_metrics["label"] = label
-        window_baselines.append(w_metrics)
-
-    elapsed = time.perf_counter() - t0
-    logger.info(
-        f"Band [{band_low:.2f},{band_high:.2f}] baseline: "
-        f"{base_metrics['n_trades']} trades, "
-        f"Sortino={base_metrics['sortino']:.3f}, "
-        f"{len(windows)} windows, {elapsed:.1f}s"
+    return build_band_cache(
+        df, band_low, band_high, n_windows, n_bootstrap,
+        order_notional_usd=10.0, min_time_in_band_days=1, spread_c=1.0,
     )
 
-    return BandCache(
-        band_low=band_low,
-        band_high=band_high,
-        baseline_metrics=base_metrics,
-        window_baselines=window_baselines,
-        windows=windows,
-    )
-
-
-# ---------------------------------------------------------------------------
-# OOS validation for one (band, alpha)
-# ---------------------------------------------------------------------------
 
 def _oos_validate(
     cache: BandCache,
@@ -199,49 +105,10 @@ def _oos_validate(
     sizing_fn: Callable[[float], float],
     n_bootstrap: int,
 ) -> Dict:
-    """Walk-forward OOS: compare alpha vs baseline (a=0) in each window."""
-    n_valid = 0
-    n_wins = 0
-    sortino_diffs: List[float] = []
-
-    for i, (start, end, df_slice) in enumerate(cache.windows):
-        wb = cache.window_baselines[i]
-        if wb.get("empty") or df_slice.empty:
-            continue
-
-        # Run alpha scheme in this window
-        w_result = _run_lean(df_slice, band_low, band_high, alpha, sizing_fn, n_bootstrap)
-        w_metrics = _metrics_row(w_result)
-
-        base_sortino = wb.get("sortino", 0.0)
-        alpha_sortino = w_metrics.get("sortino", 0.0)
-        diff = alpha_sortino - base_sortino
-
-        sortino_diffs.append(diff)
-        n_valid += 1
-        if diff > 0:
-            n_wins += 1
-
-    if n_valid == 0:
-        return {
-            "oos_n_windows": len(cache.windows),
-            "oos_n_valid": 0,
-            "oos_win_frac": 0.0,
-            "oos_mean_sortino_diff": 0.0,
-            "oos_valid": False,
-        }
-
-    win_frac = n_wins / n_valid
-    mean_diff = float(np.mean(sortino_diffs))
-    oos_valid = n_valid >= 2 and win_frac >= 0.70
-
-    return {
-        "oos_n_windows": len(cache.windows),
-        "oos_n_valid": n_valid,
-        "oos_win_frac": win_frac,
-        "oos_mean_sortino_diff": mean_diff,
-        "oos_valid": oos_valid,
-    }
+    return _oos_validate_harness(
+        cache, df, band_low, band_high, alpha, sizing_fn, n_bootstrap,
+        order_notional_usd=10.0, min_time_in_band_days=1, spread_c=1.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -626,10 +493,8 @@ def generate_markdown_report(results: List[GridPoint], output_path: Path) -> str
 
     report = "\n".join(lines)
 
-    # Write to file
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(report)
+    # Write to file (title="" -- the markdown H1 is already lines[0])
+    write_report(output_path, "", [report])
     logger.info(f"Report: {output_path}")
 
     return report
@@ -650,11 +515,11 @@ def main() -> None:
 
     # Load data
     print("Loading historical data...")
-    store = ContractPriceStore()
-    if store._data is None or len(store._data) == 0:
+    df = load_store()
+    if df.empty:
         print("No historical data. Run historical fetch first.")
         sys.exit(1)
-    print(f"  {len(store._data)} rows loaded")
+    print(f"  {len(df)} rows loaded")
 
     # Sweep parameters
     alphas = [round(x, 2) for x in np.arange(-1.0, 1.01, 0.05).tolist()]
@@ -677,7 +542,6 @@ def main() -> None:
 
     # Checkpoint path
     checkpoint_path = Path(__file__).parent.parent / "DATA" / "grid_sweep_checkpoint.csv"
-    df = store.snapshot()
 
     # Try resume
     results = load_checkpoint(checkpoint_path)

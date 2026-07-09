@@ -29,9 +29,9 @@ from backtest.allocation_analysis import (
     per_bin_breakdown,
     run_allocation_analysis,
     spearman_rho_with_ci,
-    walkforward_validate,
 )
 from backtest.engine import BacktestConfig
+from backtest.harness import walkforward_normalized as walkforward_validate
 from execution.sizing import make_sizing_fn
 
 

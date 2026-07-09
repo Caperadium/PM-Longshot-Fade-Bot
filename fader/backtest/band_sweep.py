@@ -23,14 +23,19 @@ import numpy as np
 import pandas as pd
 
 from backtest.allocation_analysis import run_allocation_analysis
-from backtest.engine import BacktestConfig, run_backtest
+from backtest.engine import BacktestConfig
+from backtest.harness import HarnessDefaults, load_store, run_config
 from backtest.historical import ContractPriceStore
 from backtest.metrics import (
     PERIODS_PER_YEAR,
     compute_all_metrics,
     sortino_ratio,
 )
+from backtest.report import write_report
 from execution.sizing import MIN_EFFECTIVE_NOTIONAL, make_sizing_fn
+
+# band_sweep uses the shared defaults unmodified (no divergence to name).
+_DEFAULTS = HarnessDefaults()
 
 logger = logging.getLogger(__name__)
 
@@ -383,12 +388,12 @@ def sweep_grid(
             spread_c=spread_c,
             slippage_c=0.0,
             adverse_selection_c=0.0,
-            n_bootstrap=5000,
+            n_bootstrap=_DEFAULTS.n_bootstrap,
             sizing_fn=sizing_fn,
         )
 
         try:
-            trades_df, equity_df = run_backtest(df, cfg)
+            row = run_config(df, cfg)
         except Exception as e:
             logger.warning(
                 f"[{idx+1}/{total_combos}] bl={bl:.2f} a={alpha:+.1f} "
@@ -398,7 +403,7 @@ def sweep_grid(
 
         elapsed = time.perf_counter() - t0
 
-        if trades_df.empty:
+        if row.empty:
             results.append(GridResult(
                 band_low=bl, band_high=band_high,
                 alpha=alpha, min_dte=min_dte, max_dte=max_dte,
@@ -411,7 +416,8 @@ def sweep_grid(
             ))
             continue
 
-        metrics = compute_all_metrics(trades_df, n_bootstrap=cfg.n_bootstrap)
+        trades_df = row.trades_df
+        metrics = row.metrics
 
         pnls = trades_df["realized_pnl"].dropna().values
         wins = pnls[pnls > 0]
@@ -624,8 +630,8 @@ def main() -> None:
         format="%(levelname)s:%(name)s: %(message)s",
     )
 
-    store = ContractPriceStore()
-    if not store._data:
+    store = load_store()
+    if store.empty:
         print("No historical data. Run historical fetch first.")
         sys.exit(1)
 
@@ -643,18 +649,16 @@ def main() -> None:
         results = sweep_lower_bound(
             store,
             low_values=low_values,
-            high=0.95,
+            high=_DEFAULTS.band_high,
             n_walkforward_windows=4,
-            n_bootstrap=5000,
+            n_bootstrap=_DEFAULTS.n_bootstrap,
         )
 
         report = format_band_sweep_report(results)
         print(report)
 
         out_path = Path(__file__).parent.parent / "DATA" / "band_sweep_report.txt"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(report)
+        write_report(out_path, "", [report])
         print(f"\nReport saved to: {out_path}")
 
     else:
@@ -663,7 +667,7 @@ def main() -> None:
         alpha_values = [round(x, 1) for x in np.arange(0.0, 1.05, 0.2).tolist()]
         min_dte_values = list(range(0, 8))   # 0..7
         max_dte_values = list(range(1, 8))   # 1..7
-        band_high = 0.95
+        band_high = _DEFAULTS.band_high
 
         dte_pairs = _generate_dte_pairs(min_dte_values, max_dte_values)
 
@@ -695,9 +699,7 @@ def main() -> None:
         print(report)
 
         out_path = Path(__file__).parent.parent / "DATA" / "grid_sweep_report.txt"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(report)
+        write_report(out_path, "", [report])
         print(f"\nReport saved to: {out_path}")
 
         # Also save full CSV

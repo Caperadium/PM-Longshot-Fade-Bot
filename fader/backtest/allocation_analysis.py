@@ -34,7 +34,6 @@ from backtest.metrics import (
     max_drawdown_pct,
     sortino_ratio,
 )
-from backtest.walkforward import partition_calendar_windows
 from execution.sizing import make_sizing_fn
 
 logger = logging.getLogger(__name__)
@@ -585,104 +584,23 @@ def walkforward_validate(
     band_high: float,
     n_windows: int = 4,
 ) -> Dict:
-    """Walk-forward validation of allocation tilt.
+    """Walk-forward validation of allocation tilt (normalized sizing).
 
     Path A (alpha_star is not None): compare a=a* vs a=0 per window.
     Path B (alpha_star is None): compare a=+1 vs a=-1 per window.
+
+    Phase 5: the implementation moved to
+    ``backtest.harness.walkforward_normalized`` (one of three distinct
+    walk-forward variants -- see harness.py module docstring). This
+    function is kept as a thin backward-compatible delegate; new code
+    should import ``walkforward_normalized`` directly from
+    ``backtest.harness``.
     """
-    from backtest.historical import ContractPriceStore
-
-    if isinstance(store_or_df, ContractPriceStore):
-        work_df = store_or_df.snapshot()
-    elif isinstance(store_or_df, pd.DataFrame):
-        work_df = store_or_df.copy()
-    else:
-        return {"error": "invalid_input"}
-
-    windows = partition_calendar_windows(work_df, n_windows=n_windows)
-    if not windows:
-        return {"error": "no_windows", "n_windows": 0}
-
-    norm_factor = compute_normalization_factor(
-        extract_entry_prices(work_df, band_low, band_high),
-        alphas, band_low, band_high,
+    from backtest.harness import walkforward_normalized
+    return walkforward_normalized(
+        store_or_df, base_cfg, alpha_star, alphas, band_low, band_high,
+        n_windows=n_windows,
     )
-
-    per_window: List[Dict] = []
-
-    for start, end, df_slice in windows:
-        label = f"{start:%Y-%m-%d}..{end:%Y-%m-%d}"
-        if df_slice.empty:
-            per_window.append({"label": label, "error": "empty_slice"})
-            continue
-
-        if alpha_star is not None:
-            # Path A: a* vs baseline
-            fn_star = _make_sized_fn(alpha_star, band_low, band_high, norm_factor)
-            fn_base = None  # baseline = fixed notional
-
-            r_star = _run_scheme(df_slice, base_cfg, fn_star, alpha_star)
-            r_base = _run_scheme(df_slice, base_cfg, fn_base, 0.0)
-
-            sortino_diff = (r_star.get("sortino") or 0.0) - (r_base.get("sortino") or 0.0)
-            per_window.append({
-                "label": label,
-                "sortino_star": r_star.get("sortino"),
-                "sortino_baseline": r_base.get("sortino"),
-                "sortino_diff": sortino_diff,
-                "star_outperforms": sortino_diff > 0,
-            })
-        else:
-            # Path B: extremes comparison
-            fn_neg = _make_sized_fn(-1.0, band_low, band_high, norm_factor)
-            fn_pos = _make_sized_fn(+1.0, band_low, band_high, norm_factor)
-
-            r_neg = _run_scheme(df_slice, base_cfg, fn_neg, -1.0)
-            r_pos = _run_scheme(df_slice, base_cfg, fn_pos, +1.0)
-
-            sortino_diff = (r_pos.get("sortino") or 0.0) - (r_neg.get("sortino") or 0.0)
-            per_window.append({
-                "label": label,
-                "sortino_pos": r_pos.get("sortino"),
-                "sortino_neg": r_neg.get("sortino"),
-                "sortino_diff": sortino_diff,
-                "high_prob_wins": sortino_diff > 0,
-            })
-
-    # Summary
-    n_valid = sum(1 for w in per_window if "sortino_diff" in w)
-    if n_valid == 0:
-        return {"error": "no_valid_windows", "n_windows": len(windows), "per_window": per_window}
-
-    if alpha_star is not None:
-        n_star_wins = sum(1 for w in per_window if w.get("star_outperforms", False))
-        mean_diff = float(np.mean([w["sortino_diff"] for w in per_window if "sortino_diff" in w]))
-        oos_valid = n_valid >= 2 and n_star_wins / n_valid >= 0.70
-        return {
-            "path": "A",
-            "alpha_star": alpha_star,
-            "n_windows": len(windows),
-            "n_valid": n_valid,
-            "n_star_wins": n_star_wins,
-            "star_win_frac": n_star_wins / n_valid,
-            "mean_sortino_diff": mean_diff,
-            "oos_valid": oos_valid,
-            "per_window": per_window,
-        }
-    else:
-        n_high_wins = sum(1 for w in per_window if w.get("high_prob_wins", False))
-        mean_diff = float(np.mean([w["sortino_diff"] for w in per_window if "sortino_diff" in w]))
-        oos_valid = n_valid >= 2 and n_high_wins / n_valid >= 0.70
-        return {
-            "path": "B",
-            "n_windows": len(windows),
-            "n_valid": n_valid,
-            "n_high_prob_wins": n_high_wins,
-            "high_prob_win_frac": n_high_wins / n_valid,
-            "mean_sortino_diff": mean_diff,
-            "oos_valid": oos_valid,
-            "per_window": per_window,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -991,11 +909,12 @@ def format_report(results: Dict) -> str:
 def main() -> None:
     """Run allocation analysis from CLI and print report."""
     import sys
+    from backtest.harness import load_store
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 
-    store = ContractPriceStore()
+    store = load_store()
 
-    if store._data is None or len(store._data) == 0:
+    if store.empty:
         print("No historical data found. Run historical fetch first.")
         sys.exit(1)
 

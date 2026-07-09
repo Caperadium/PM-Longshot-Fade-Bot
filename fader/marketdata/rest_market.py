@@ -30,8 +30,56 @@ DEFAULT_TIMEOUT = 15
 MAX_RETRIES = 3
 CALL_DELAY_S = 0.05
 
+# Case-insensitive match for the "No" outcome (Phase 6, item 3).
+OUTCOME_NO = "no"
+
 # Progress callback: receives a human-readable status line.
 ProgressFn = Callable[[str], None]
+
+
+def parse_market_outcomes(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse a Gamma market dict's ``clobTokenIds``/``outcomes`` fields.
+
+    Both fields come back from Gamma as either a JSON-string-encoded list
+    or (occasionally, depending on endpoint) an already-decoded list.
+    Centralizes the three previously-duplicated parse sites:
+    ``discover_new_rungs``, ``discover_series_markets`` (both in this
+    module) and ``execution.provider.LiveProvider.resolve_no_token``.
+
+    Returns a dict:
+      - token_ids: list[str] parsed clobTokenIds (``[]`` if missing/unparseable)
+      - outcomes: list[str] parsed outcomes (``[]`` if missing/unparseable)
+      - no_index: int | None -- index of the outcome matching "no"
+        (case-insensitive, whitespace-trimmed), or None if absent
+      - no_token_id: str | None -- token id at no_index, or None
+      - no_outcome: str | None -- raw outcome string at no_index, or None
+    """
+    raw_tokens = raw.get("clobTokenIds", "[]")
+    raw_outcomes = raw.get("outcomes", "[]")
+    try:
+        token_ids = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
+    except (json.JSONDecodeError, TypeError):
+        token_ids = []
+    try:
+        outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
+    except (json.JSONDecodeError, TypeError):
+        outcomes = []
+    token_ids = token_ids or []
+    outcomes = outcomes or []
+
+    no_index: Optional[int] = None
+    for i, outcome in enumerate(outcomes):
+        if outcome.strip().lower() == OUTCOME_NO and i < len(token_ids):
+            no_index = i
+            break
+
+    return {
+        "token_ids": token_ids,
+        "outcomes": outcomes,
+        "no_index": no_index,
+        "no_token_id": token_ids[no_index] if no_index is not None else None,
+        "no_outcome": outcomes[no_index] if no_index is not None else None,
+    }
 
 
 def _get(url: str, params: Optional[Dict] = None, timeout: int = DEFAULT_TIMEOUT) -> Any:
@@ -158,23 +206,18 @@ def discover_new_rungs(
                 s = mkt.get("slug", "")
                 if s and s not in seen:
                     # Check it has a NO token
-                    raw_tokens = mkt.get("clobTokenIds", "[]")
-                    raw_outcomes = mkt.get("outcomes", "[]")
-                    tids = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
-                    outcomes = json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-                    for i, o in enumerate(outcomes):
-                        if o.strip().lower() == "no" and i < len(tids):
-                            new_rungs.append({
-                                "slug": s,
-                                "condition_id": mkt.get("conditionId", ""),
-                                "token_id": tids[i],
-                                "outcome": o,
-                                "outcome_index": i,
-                                "end_date_iso": mkt.get("endDateIso", ""),
-                                "active": bool(mkt.get("active", True)),
-                            })
-                            seen.add(s)
-                            break
+                    parsed = parse_market_outcomes(mkt)
+                    if parsed["no_index"] is not None:
+                        new_rungs.append({
+                            "slug": s,
+                            "condition_id": mkt.get("conditionId", ""),
+                            "token_id": parsed["no_token_id"],
+                            "outcome": parsed["no_outcome"],
+                            "outcome_index": parsed["no_index"],
+                            "end_date_iso": mkt.get("endDateIso", ""),
+                            "active": bool(mkt.get("active", True)),
+                        })
+                        seen.add(s)
         except Exception as e:
             logger.warning(f"discover_new_rungs for {slug}: {e}")
 
@@ -322,37 +365,24 @@ def discover_series_markets(
                 mkt_slug = mkt.get("slug", "")
                 if not mkt_slug or series_filter not in mkt_slug.lower():
                     continue
-                raw_tokens = mkt.get("clobTokenIds", "[]")
-                raw_outcomes = mkt.get("outcomes", "[]")
-                token_ids = (
-                    json.loads(raw_tokens)
-                    if isinstance(raw_tokens, str)
-                    else raw_tokens
-                )
-                outcomes = (
-                    json.loads(raw_outcomes)
-                    if isinstance(raw_outcomes, str)
-                    else raw_outcomes
-                )
-                for i, o in enumerate(outcomes):
-                    if o.strip().lower() == "no" and i < len(token_ids):
-                        tid = token_ids[i]
-                        if tid not in seen_tokens:
-                            seen_tokens.add(tid)
-                            results.append({
-                                "slug": mkt_slug,
-                                "token_id": tid,
-                                "end_date": mkt.get("endDateIso") or mkt.get("endDate") or "",
-                                "resolution": _resolution_from_outcome_prices(
-                                    outcomes,
-                                    mkt.get("outcomePrices"),
-                                    mkt.get("closed"),
-                                ),
-                                "condition_id": mkt.get("conditionId", ""),
-                                "active": bool(mkt.get("active", True)),
-                                "question": mkt.get("question", ""),
-                            })
-                        break
+                parsed = parse_market_outcomes(mkt)
+                if parsed["no_index"] is not None:
+                    tid = parsed["no_token_id"]
+                    if tid not in seen_tokens:
+                        seen_tokens.add(tid)
+                        results.append({
+                            "slug": mkt_slug,
+                            "token_id": tid,
+                            "end_date": mkt.get("endDateIso") or mkt.get("endDate") or "",
+                            "resolution": _resolution_from_outcome_prices(
+                                parsed["outcomes"],
+                                mkt.get("outcomePrices"),
+                                mkt.get("closed"),
+                            ),
+                            "condition_id": mkt.get("conditionId", ""),
+                            "active": bool(mkt.get("active", True)),
+                            "question": mkt.get("question", ""),
+                        })
 
         time.sleep(CALL_DELAY_S)
 
