@@ -40,6 +40,7 @@ if str(_FADER_ROOT) not in sys.path:
 from dotenv import load_dotenv
 from config.config_loader import load_config, ConfigWatcher, apply_config_kv_overrides
 from infra.logging_setup import setup_logging
+from infra.ipv4 import force_ipv4
 from infra.db import init_db
 from infra import telegram
 from engine.build import build_engine
@@ -59,6 +60,7 @@ async def run() -> int:
     setup_logging(
         level="INFO", log_file=str(_FADER_ROOT / "engine.log"), json_console=False,
     )
+    force_ipv4()  # Cloudflare IPv6 egress is unroutable on this host; prefer IPv4
     init_db()
     apply_config_kv_overrides(cfg)  # overlay dashboard-written params
     telegram.configure(enabled=cfg.telegram.enabled)

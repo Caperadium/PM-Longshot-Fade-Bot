@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -191,6 +192,11 @@ class WsClient:
             self._ws_url,
             ping_interval=None,  # we send our own keepalives
             close_timeout=5,
+            # Force IPv4: the CLOB WS host serves AAAA records, but IPv6 egress
+            # to Cloudflare is unroutable from some hosts (e.g. OVH VPS). Without
+            # this, connect() tries the dead IPv6 address first and the opening
+            # handshake times out (~10s) before falling back to IPv4.
+            family=socket.AF_INET,
         ) as ws:
             self._ws = ws
             self._connected = True

@@ -31,9 +31,12 @@ if str(_FADER_ROOT) not in sys.path:
     sys.path.insert(0, str(_FADER_ROOT))
 
 from infra.db import get_connection, init_db
+from infra.ipv4 import force_ipv4
 from engine.control_consumer import issue_command
 from persistence.repos import config_kv_repo, positions_repo
 from dashboard import backtest_page
+
+force_ipv4()  # Cloudflare IPv6 egress is unroutable on this host; prefer IPv4
 
 st.set_page_config(
     page_title="Fader Bot", layout="wide", initial_sidebar_state="expanded"

@@ -197,6 +197,7 @@ Current series:
 | `engine/state_publisher.py` | Engine → DB state publishing (2s interval) |
 | `infra/db.py` | SQLite WAL schema, all 10 tables + 11 indexes; low-level `get_connection`/`execute_write` primitives that `persistence/repos.py` builds on |
 | `infra/telegram.py` | Telegram alerts (heartbeat, breaker trips, errors) |
+| `infra/ipv4.py` | `force_ipv4()`: patches urllib3 address-family selection so all HTTP egress (requests, py-clob-client, Telegram) is IPv4-only; ws_client separately passes `family=AF_INET`. Needed on hosts with unroutable IPv6 to Cloudflare (OVH VPS). Called at engine startup + dashboard load |
 | `infra/rate_limiter.py` | Token-bucket rate limiter for API calls |
 | `infra/logging_setup.py` | Structured logging configuration |
 | `persistence/repos.py` | Typed repository layer (`Db`, `PositionsRepo`, `OrdersRepo`, `BreakerRepo`, `DecisionsRepo`, `ControlRepo`, `EngineStateRepo`, `ConfigKVRepo`) — all engine-side SQL lives here. Module-level default instances (`positions_repo`, `orders_repo`, etc.) are used directly by engine code this phase; `Db.transaction()` gives atomic multi-statement writes (e.g. order-fill bookkeeping). Every method takes an optional `conn`: passed-in conn -> caller owns commit/close; `None` -> repo opens/commits/closes per call. |
