@@ -1,1 +1,3 @@
 # Changes
+
+- Fix Calibration tab crashing mid-render on hosts without matplotlib (the VPS venv lacks it): `Styler.background_gradient` imports matplotlib lazily inside `st.dataframe`, killing the page below the headline metrics. New `_render_styled_table` helper in `fader/dashboard/calibration_page.py` probes for matplotlib and falls back to a plain formatted table when absent; both gradient call sites (per-bucket and bot-trade tables) now use it. Known related issue, not touched: `dashboard/backtest_page.py`'s walk-forward heatmap uses the same `background_gradient` idiom and is likewise broken on the VPS.
