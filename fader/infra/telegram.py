@@ -141,6 +141,105 @@ async def alert_reconcile_failures(count: int, context: str, error: str) -> None
     )
 
 
+def format_bankroll_message(
+    bankroll: float,
+    open_positions: int,
+    deployed: float,
+    pnl_today: float,
+    pnl_total: float,
+) -> str:
+    """Reply body for the /bankroll command."""
+    return (
+        "<b>Fader status</b>\n"
+        f"Bankroll: ${bankroll:,.2f}\n"
+        f"Open positions: {open_positions}\n"
+        f"Deployed: ${deployed:,.2f}\n"
+        f"PnL today: {pnl_today:+,.2f} USDC\n"
+        f"PnL total: {pnl_total:+,.2f} USDC"
+    )
+
+
+def _get_updates_sync(offset: Optional[int], timeout: int) -> list:
+    """Blocking getUpdates long poll. Returns [] when disabled or on error."""
+    if not _ENABLED:
+        return []
+    try:
+        url = f"https://api.telegram.org/bot{_BOT_TOKEN}/getUpdates"
+        params: dict = {"timeout": timeout, "allowed_updates": '["message"]'}
+        if offset is not None:
+            params["offset"] = offset
+        resp = requests.get(url, params=params, timeout=timeout + 15)
+        if not resp.ok:
+            logger.warning(
+                f"Telegram getUpdates failed: {resp.status_code} {resp.text[:100]}"
+            )
+            return []
+        return resp.json().get("result", [])
+    except Exception as e:
+        logger.warning(f"Telegram getUpdates error: {e}")
+        return []
+
+
+class CommandListenerTask:
+    """Answer inbound commands from the configured chat via getUpdates.
+
+    Commands: /bankroll -> reply with stats_fn() (async, returns the HTML
+    message body). Messages from any other chat id are ignored. This is
+    the only getUpdates consumer in the codebase -- Telegram allows one
+    consumer per bot, and none may run while a webhook is set.
+    """
+
+    def __init__(self, stats_fn) -> None:
+        self._stats_fn = stats_fn
+        self._task: Optional[asyncio.Task] = None
+        self._offset: Optional[int] = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+
+    async def _loop(self) -> None:
+        if not _ENABLED:
+            return
+        loop = asyncio.get_running_loop()
+        # Drain the backlog so a restart doesn't replay commands sent
+        # while the engine was down.
+        backlog = await loop.run_in_executor(None, _get_updates_sync, None, 0)
+        if backlog:
+            self._offset = backlog[-1]["update_id"] + 1
+        while True:
+            try:
+                updates = await loop.run_in_executor(
+                    None, _get_updates_sync, self._offset, 30
+                )
+                for u in updates:
+                    self._offset = u["update_id"] + 1
+                    await self._handle(u)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Telegram command loop error: {e}")
+                await asyncio.sleep(5)
+
+    async def _handle(self, update: dict) -> None:
+        msg = update.get("message") or {}
+        chat_id = str((msg.get("chat") or {}).get("id", ""))
+        text = (msg.get("text") or "").strip()
+        if chat_id != str(_CHAT_ID):
+            return
+        if not text.startswith("/bankroll"):
+            return
+        try:
+            reply = await self._stats_fn()
+        except Exception as e:
+            logger.warning(f"/bankroll stats error: {e}")
+            reply = f"<b>Error building status</b>:\n<code>{str(e)[:200]}</code>"
+        await send(reply)
+
+
 class HeartbeatTask:
     """Send a periodic heartbeat message."""
 

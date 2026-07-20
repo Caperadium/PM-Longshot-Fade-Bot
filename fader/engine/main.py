@@ -175,6 +175,20 @@ async def run() -> int:
     heartbeat = telegram.HeartbeatTask(interval_minutes=cfg.telegram.heartbeat_minutes)
     heartbeat.start()
 
+    async def _bankroll_status() -> str:
+        from persistence.repos import positions_repo
+
+        return telegram.format_bankroll_message(
+            bankroll=engine.reconciler.bankroll,
+            open_positions=positions_repo.open_count(),
+            deployed=positions_repo.open_notional(),
+            pnl_today=positions_repo.realized_pnl_today(),
+            pnl_total=positions_repo.realized_pnl_total(),
+        )
+
+    command_listener = telegram.CommandListenerTask(_bankroll_status)
+    command_listener.start()
+
     asyncio.create_task(config_watch_loop(engine, cfg, config_watcher))
     asyncio.create_task(requote_loop(engine))
 
@@ -217,6 +231,7 @@ async def run() -> int:
     engine.state_publisher.stop()
     control.stop()
     heartbeat.stop()
+    command_listener.stop()
     await telegram.alert_stop(
         "cold restart" if restart_requested["flag"] else "graceful shutdown"
     )

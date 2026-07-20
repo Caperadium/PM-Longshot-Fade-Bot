@@ -45,7 +45,7 @@ risk:
   matic_min_balance: 0.0  # MATIC; not required for off-chain CLOB orders
 
 telegram:
-  heartbeat_minutes: 15
+  heartbeat_minutes: 180  # 3h between heartbeats
   enabled: true
 
 # Conservative token-bucket rates; orders of magnitude below documented CLOB limits.

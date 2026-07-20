@@ -200,7 +200,7 @@ Current series:
 | `engine/pollers.py` | Bankroll (30s), resolution (60s), discovery (300s), calibration fetch (6h) background tasks; discovery mutates the shared `MarketRegistry` (`engine/registry.py`) instead of a bare dict; `_calibration_loop` runs `update_calibration_data` via `asyncio.to_thread`, telegram escalation after 5 consecutive failures |
 | `engine/state_publisher.py` | Engine → DB state publishing (2s interval) |
 | `infra/db.py` | SQLite WAL schema, all 10 tables + 11 indexes; low-level `get_connection`/`execute_write` primitives that `persistence/repos.py` builds on |
-| `infra/telegram.py` | Telegram alerts (heartbeat, breaker trips, errors) |
+| `infra/telegram.py` | Telegram alerts (heartbeat every `telegram.heartbeat_minutes` (default 3h), breaker trips, errors) + inbound commands: `CommandListenerTask` long-polls getUpdates (sole consumer; incompatible with a webhook on the bot) and answers `/bankroll` from the configured chat with bankroll / open positions / deployed / PnL today+total via a stats fn injected from `engine/main.py` |
 | `infra/ipv4.py` | `force_ipv4()`: patches urllib3 address-family selection so all HTTP egress (requests, py-clob-client, Telegram) is IPv4-only; ws_client separately passes `family=AF_INET`. Needed on hosts with unroutable IPv6 to Cloudflare (OVH VPS). Called at engine startup + dashboard load |
 | `infra/rate_limiter.py` | Token-bucket rate limiter for API calls |
 | `infra/logging_setup.py` | Structured logging configuration |

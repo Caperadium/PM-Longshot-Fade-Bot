@@ -168,6 +168,51 @@ class PositionsRepo:
             if own_conn:
                 conn.close()
 
+    def open_notional(self, conn: Optional[sqlite3.Connection] = None) -> float:
+        """Sum of notional across OPEN positions (deployed capital)."""
+        own_conn = conn is None
+        if own_conn:
+            conn = get_connection()
+        try:
+            return float(conn.execute(
+                "SELECT COALESCE(SUM(notional), 0) FROM positions WHERE status='OPEN'"
+            ).fetchone()[0])
+        finally:
+            if own_conn:
+                conn.close()
+
+    def realized_pnl_total(self, conn: Optional[sqlite3.Connection] = None) -> float:
+        """Sum of realized_pnl across all CLOSED positions."""
+        own_conn = conn is None
+        if own_conn:
+            conn = get_connection()
+        try:
+            return float(conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0) FROM positions "
+                "WHERE status='CLOSED'"
+            ).fetchone()[0])
+        finally:
+            if own_conn:
+                conn.close()
+
+    def realized_pnl_today(self, conn: Optional[sqlite3.Connection] = None) -> float:
+        """Sum of realized_pnl for positions resolved today (UTC).
+
+        date() tolerates the ISO variants writers use for resolved_at
+        (space or 'T' separator, optional offset suffix)."""
+        own_conn = conn is None
+        if own_conn:
+            conn = get_connection()
+        try:
+            return float(conn.execute(
+                "SELECT COALESCE(SUM(realized_pnl), 0) FROM positions "
+                "WHERE status='CLOSED' AND realized_pnl IS NOT NULL "
+                "AND date(resolved_at) = date('now')"
+            ).fetchone()[0])
+        finally:
+            if own_conn:
+                conn.close()
+
     def open_for_paper_poll(
         self, limit: int, conn: Optional[sqlite3.Connection] = None
     ) -> List[sqlite3.Row]:
