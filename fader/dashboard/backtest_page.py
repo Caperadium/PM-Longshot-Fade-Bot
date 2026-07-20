@@ -34,6 +34,7 @@ from backtest.historical import (
 from backtest.engine import BacktestConfig, run_backtest
 from backtest.metrics import compute_all_metrics
 from config.config_loader import load_config
+from dashboard.table_style import styled_dataframe
 from execution.sizing import make_sizing_fn
 
 
@@ -694,12 +695,7 @@ def render(embedded: bool = True) -> None:
                 hm_df = pd.DataFrame(heatmap_data).T
                 hm_df.index.name = "Band Low"
                 hm_df.columns.name = "Band High"
-                st.dataframe(
-                    hm_df.style.background_gradient(
-                        axis=None, cmap="RdYlGn"
-                    ).format("{:.3f}"),
-                    width='stretch',
-                )
+                styled_dataframe(hm_df, "{:.3f}", axis=None)
 
 
 if __name__ == "__main__":

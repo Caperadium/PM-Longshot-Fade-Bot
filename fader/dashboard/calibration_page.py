@@ -46,6 +46,7 @@ from backtest.calibration import (
 )
 from backtest.historical import ContractPriceStore, PRICES_CSV
 from config.config_loader import apply_config_kv_overrides, load_config
+from dashboard.table_style import styled_dataframe
 from infra.db import get_connection
 from marketdata.rest_market import _derive_series_filter
 
@@ -119,26 +120,6 @@ def _count_pending_resolution(snapshot_df: pd.DataFrame) -> int:
         if end_dates.iloc[0] < today:
             pending += 1
     return pending
-
-
-def _render_styled_table(df: pd.DataFrame, gradient_col: str, fmt: dict) -> None:
-    """Render df with a RdYlGn gradient on gradient_col when matplotlib is
-    available, plain formatted table otherwise.
-
-    Styler.background_gradient imports matplotlib lazily at render time
-    (inside st.dataframe's styler compute), so without this probe a deploy
-    target that lacks matplotlib crashes the whole page mid-render instead
-    of just losing the color shading.
-    """
-    try:
-        import matplotlib  # noqa: F401  (availability probe only)
-
-        styled = df.style.background_gradient(
-            subset=[gradient_col], cmap="RdYlGn"
-        ).format(fmt)
-    except ImportError:
-        styled = df.style.format(fmt)
-    st.dataframe(styled, width='stretch')
 
 
 def _series_filter_for(row) -> str:
@@ -334,7 +315,7 @@ def render(embedded: bool = True) -> None:
     # ------------------------------------------------------------------
     st.subheader("Per-bucket detail")
     if not bucket_df.empty:
-        _render_styled_table(bucket_df, "edge", _BUCKET_FORMAT)
+        styled_dataframe(bucket_df, _BUCKET_FORMAT, subset=["edge"])
     else:
         st.info("No bucketed observations for the current filters.")
 
@@ -398,7 +379,7 @@ def render(embedded: bool = True) -> None:
 
             bot_bucket_df = bot_trade_calibration(positions_df, bucket_width=0.05)
             if not bot_bucket_df.empty:
-                _render_styled_table(bot_bucket_df, "edge_pp", _BOT_BUCKET_FORMAT)
+                styled_dataframe(bot_bucket_df, _BOT_BUCKET_FORMAT, subset=["edge_pp"])
 
 
 if __name__ == "__main__":
