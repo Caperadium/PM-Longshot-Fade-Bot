@@ -1,3 +1,1 @@
 # Changes
-
-- Telegram: heartbeat interval lowered to every 3 hours (`telegram.heartbeat_minutes: 180` in config.yaml) and new inbound `/bankroll` command. `infra/telegram.py` gains `CommandListenerTask` (getUpdates long-poll loop, answers only the configured `TELEGRAM_CHAT_ID`, drains backlog on startup so restarts do not replay old commands; the module's only getUpdates consumer) and `format_bankroll_message`; `engine/main.py` starts/stops the listener next to the heartbeat and feeds it a stats fn returning bankroll (reconciler), open-position count, deployed notional, and realized PnL today/total. `PositionsRepo` gains `open_notional`, `realized_pnl_total`, `realized_pnl_today`. Tests: `fader/tests/test_telegram_bankroll.py` (8).
