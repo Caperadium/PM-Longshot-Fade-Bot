@@ -34,7 +34,7 @@ from infra.db import get_connection, init_db
 from infra.ipv4 import force_ipv4
 from engine.control_consumer import issue_command
 from persistence.repos import config_kv_repo, positions_repo
-from dashboard import backtest_page
+from dashboard import backtest_page, calibration_page
 
 force_ipv4()  # Cloudflare IPv6 egress is unroutable on this host; prefer IPv4
 
@@ -435,9 +435,10 @@ if st.sidebar.button("Add Slug") and new_slug_input.strip():
     tab_risk,
     tab_feed,
     tab_backtest,
+    tab_calibration,
 ) = st.tabs([
     "Overview", "Positions", "Orders", "Decisions", "PnL & Metrics", "Risk",
-    "Feed", "Backtest",
+    "Feed", "Backtest", "Calibration",
 ])
 
 # ---- OVERVIEW ----
@@ -630,3 +631,7 @@ with tab_feed:
 # ---- BACKTEST ----
 with tab_backtest:
     backtest_page.render(embedded=True)
+
+# ---- CALIBRATION ----
+with tab_calibration:
+    calibration_page.render(embedded=True)

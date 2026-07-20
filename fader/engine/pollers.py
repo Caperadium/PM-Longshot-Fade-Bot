@@ -4,6 +4,7 @@ Background polling tasks:
   - Bankroll reconcile + MATIC balance + USDC allowance (30s)
   - Resolution status + orders reconciliation (60s)
   - New-rung discovery for ladder markets (5 min)
+  - Calibration data fetch for the dashboard Calibration tab (6h default)
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ class Pollers:
             asyncio.create_task(self._resolution_loop()),
             asyncio.create_task(self._discovery_loop()),
             asyncio.create_task(self._maintenance_loop()),
+            asyncio.create_task(self._calibration_loop()),
         ]
 
     def stop(self) -> None:
@@ -110,6 +112,70 @@ class Pollers:
                 f"DB retention prune: {n1} decisions, {n2} control_commands "
                 f"older than {retention_days}d removed"
             )
+
+    async def _calibration_loop(self) -> None:
+        """Keep DATA/historical_prices.csv fresh for the dashboard's
+        Calibration tab (yes-resolution-rate vs implied-probability
+        tracking). Runs ``update_calibration_data`` (backtest/historical.py)
+        off the event loop: recent-window series discovery, fetch of any
+        token not yet in the store, and a re-check of tokens fetched while
+        still open so their resolution eventually gets stamped once Gamma
+        reports the market closed.
+
+        Runs once immediately at startup (so the tab has fresh-ish data
+        without waiting a full interval), then sleeps
+        ``cfg.polling.calibration_fetch_s`` between runs. An interval
+        ``<= 0`` disables the fetch itself but keeps checking every 5min so
+        a hot-reloaded config can re-enable it without an engine restart.
+        Exceptions never escape this loop -- a calibration-fetch failure
+        must not take down the engine.
+        """
+        failures = 0
+        while True:
+            interval = self._cfg.polling.calibration_fetch_s
+            if interval <= 0:
+                await asyncio.sleep(300)
+                continue
+            try:
+                await asyncio.to_thread(self._run_calibration_update)
+                failures = 0
+            except Exception as e:
+                failures += 1
+                logger.error(f"Calibration fetch error ({failures} consecutive): {e}")
+                if failures >= 5:
+                    from infra import telegram
+                    telegram.fire(
+                        telegram.alert_reconcile_failures(
+                            failures, "calibration_fetch", str(e)
+                        )
+                    )
+            await asyncio.sleep(interval)
+
+    def _run_calibration_update(self) -> None:
+        """Blocking body of the calibration fetch, run via
+        ``asyncio.to_thread`` from ``_calibration_loop``. Deferred import
+        of ``backtest.historical`` mirrors ``_discover_new_rungs``'s
+        deferred import of ``marketdata.rest_market`` -- keeps this
+        module's own import graph light.
+        """
+        from backtest.historical import ContractPriceStore, update_calibration_data
+
+        # Fresh store instance each cycle: picks up any rows the
+        # dashboard's Backtest-tab fetch button wrote since the last
+        # cycle (two-writer situation -- see update_calibration_data's
+        # docstring for the last-writer-wins / self-healing tradeoff).
+        store = ContractPriceStore()
+        # ALL slugs.csv rows, including disabled ones -- the calibration
+        # universe is intentionally broader than the live trading universe
+        # (e.g. it should still track a series that's temporarily disabled).
+        slugs = [s.slug for s in self._cfg.slugs]
+        configs = {s.slug: s for s in self._cfg.slugs}
+
+        stats = update_calibration_data(
+            store, slugs, configs,
+            progress=lambda m: logger.info(f"[calib] {m}"),
+        )
+        logger.info(f"Calibration update stats: {stats}")
 
     async def _discover_new_rungs(self) -> None:
         from marketdata.rest_market import discover_new_rungs

@@ -31,6 +31,7 @@ polling:
   resolution_s: 60
   discovery_s: 300
   control_poll_s: 1.0
+  calibration_fetch_s: 21600  # calibration data fetch (6h); 0 disables
 
 orders:
   spread_market_threshold_c: 1.0  # cents; <= this = market order

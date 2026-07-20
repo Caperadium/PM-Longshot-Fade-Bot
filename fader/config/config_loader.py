@@ -74,6 +74,7 @@ class PollingConfig:
     resolution_s: int = 60
     discovery_s: int = 300
     control_poll_s: float = 1.0
+    calibration_fetch_s: int = 21600  # 6h; <= 0 disables the calibration-data poller
 
 
 @dataclass
@@ -336,6 +337,7 @@ class ConfigWatcher:
         c.polling.resolution_s = n.polling.resolution_s
         c.polling.discovery_s = n.polling.discovery_s
         c.polling.control_poll_s = n.polling.control_poll_s
+        c.polling.calibration_fetch_s = n.polling.calibration_fetch_s
         # Orders (all hot)
         c.orders.spread_market_threshold_c = n.orders.spread_market_threshold_c
         c.orders.requote_move_c = n.orders.requote_move_c

@@ -21,6 +21,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
@@ -59,6 +60,8 @@ from marketdata.rest_market import (
     _series_date_slug_groups,
     _resolution_from_outcome_prices,
     discover_series_markets,
+    fetch_market_metadata,
+    parse_market_outcomes,
     parse_series_date,
 )
 
@@ -209,10 +212,37 @@ class ContractPriceStore:
             self._data.append(row)
 
     def save(self) -> None:
-        with open(self._path, "w", newline="", encoding="utf-8") as f:
+        """Write the store to disk atomically.
+
+        Writes to a ``.tmp`` sibling then ``os.replace``s it over the real
+        path -- a reader (e.g. the dashboard's ``_load()``) never observes a
+        half-written file. ``os.replace`` is atomic on NTFS/POSIX, but on
+        Windows it can raise ``PermissionError`` if another process briefly
+        holds the destination file open (e.g. the dashboard mid-read); retry
+        a few times before giving up. On final failure, log a warning and
+        leave the ``.tmp`` file in place -- the next successful save()
+        overwrites it, so nothing is lost, just delayed.
+        """
+        tmp_path = self._path.with_suffix(".tmp")
+        with open(tmp_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=self.SCHEMA)
             writer.writeheader()
             writer.writerows(self._data)
+
+        retries = 5
+        for attempt in range(retries):
+            try:
+                os.replace(tmp_path, self._path)
+                return
+            except PermissionError as e:
+                if attempt == retries - 1:
+                    logger.warning(
+                        f"save(): os.replace({tmp_path.name} -> {self._path.name}) "
+                        f"failed after {retries} attempts: {e}; leaving {tmp_path.name} "
+                        f"in place, next save() will overwrite it"
+                    )
+                    return
+                time.sleep(1)
 
     def get_rows(self, token_id: str) -> List[Dict[str, str]]:
         return [r for r in self._data if r["token_id"] == token_id]
@@ -260,9 +290,11 @@ class ContractPriceStore:
         """Append a resolution record to the resolutions CSV.
 
         Resolutions are stored separately from price rows so that
-        re-fetches cannot silently overwrite settlement data.  The
-        backtest engine joins resolutions onto the price snapshot at
-        settlement time.
+        re-fetches cannot silently overwrite settlement data.  This
+        mechanism is currently unused -- no caller reads resolutions.csv;
+        the backtest engine and the calibration updater both read
+        resolution off the price-row ``resolution`` column instead (stamped
+        by ``_apply_fetch_result`` on the last observed day).
         """
         import csv
         rpath = self.resolution_path()
@@ -309,6 +341,48 @@ def _fetch_one_market(
     history = fetch_price_history(token_id)
     return {"slug": slug, "token_id": token_id, "history": history,
             "end_date": end_date, "resolution": resolution}
+
+
+def _apply_fetch_result(store: "ContractPriceStore", res: Dict[str, Any]) -> int:
+    """Apply one ``_fetch_one_market`` result to the store (main thread).
+
+    Hoisted from ``fetch_and_store``'s local ``_apply`` closure so
+    ``update_calibration_data`` can reuse the identical upsert/resolution-
+    stamping behavior instead of duplicating it. Upserts every fetched
+    point, then (if a resolution string was carried on the item) stamps it
+    onto the last observed day so the backtest can settle positions held to
+    expiry (payout = 1 if NO won, else 0).
+
+    Returns the number of points added, or -1 to signal a failure (token
+    could not be resolved, so there was nothing to fetch).
+    """
+    slug, token_id = res["slug"], res["token_id"]
+    end_date, resolution = res["end_date"], res["resolution"]
+    if token_id is None:
+        return -1  # signal failure
+    added = 0
+    last_date: Optional[str] = None
+    for point in res["history"]:
+        ts = point.get("t", 0)  # CLOB returns UNIX seconds
+        price = float(point.get("p", 0))
+        if ts <= 0 or price <= 0:
+            continue
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        date_str = dt.strftime("%Y-%m-%d")
+        store.upsert(slug, token_id, date_str, price, end_date=end_date)
+        added += 1
+        if last_date is None or date_str > last_date:
+            last_date = date_str
+    # Stamp resolution onto the final observed day so the backtest can settle
+    # positions held to expiry (payout = 1 if NO won, else 0).
+    if resolution and last_date is not None:
+        last_price = next(
+            (float(r["price"]) for r in store.get_rows(token_id)
+             if r["date"] == last_date), 0.0,
+        )
+        store.upsert(slug, token_id, last_date, last_price,
+                     resolution=resolution, end_date=end_date)
+    return added
 
 
 def fetch_and_store(
@@ -410,43 +484,13 @@ def fetch_and_store(
     )
     n_fetched = n_failed = n_points = 0
 
-    def _apply(res: Dict[str, Any]) -> int:
-        """Apply one worker result to the store (main thread). Returns points added."""
-        slug, token_id = res["slug"], res["token_id"]
-        end_date, resolution = res["end_date"], res["resolution"]
-        if token_id is None:
-            return -1  # signal failure
-        added = 0
-        last_date: Optional[str] = None
-        for point in res["history"]:
-            ts = point.get("t", 0)  # CLOB returns UNIX seconds
-            price = float(point.get("p", 0))
-            if ts <= 0 or price <= 0:
-                continue
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-            date_str = dt.strftime("%Y-%m-%d")
-            store.upsert(slug, token_id, date_str, price, end_date=end_date)
-            added += 1
-            if last_date is None or date_str > last_date:
-                last_date = date_str
-        # Stamp resolution onto the final observed day so the backtest can settle
-        # positions held to expiry (payout = 1 if NO won, else 0).
-        if resolution and last_date is not None:
-            last_price = next(
-                (float(r["price"]) for r in store.get_rows(token_id)
-                 if r["date"] == last_date), 0.0,
-            )
-            store.upsert(slug, token_id, last_date, last_price,
-                         resolution=resolution, end_date=end_date)
-        return added
-
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_fetch_one_market, item): item for item in work}
         done = 0
         for fut in as_completed(futures):
             done += 1
             res = fut.result()
-            added = _apply(res)
+            added = _apply_fetch_result(store, res)
             if added < 0:
                 n_failed += 1
                 report(f"  [{done}/{n_total}] {res['slug']}: could not resolve token_id")
@@ -470,3 +514,275 @@ def fetch_and_store(
         f"{len(store._data)} total rows saved to {store._path.name}"
     )
     return store
+
+
+# ---------------------------------------------------------------------------
+# Calibration data updater (engine background poller + one-shot CLI use)
+# ---------------------------------------------------------------------------
+
+def select_stale_unresolved(
+    rows: List[Dict[str, str]],
+    now: datetime,
+    cap: int = 200,
+    grace_hours: int = 2,
+) -> List[Tuple[str, str, str]]:
+    """Find tokens whose resolution was never stamped, past their end_date.
+
+    A market fetched while still open gets no resolution stamp (only the
+    last-observed-day upsert stamps it, and ``fetch_and_store``'s
+    skip-existing logic means that market is never re-fetched once its
+    token is in the store) -- so its resolution is skipped forever unless
+    something re-checks it. This finds those candidates.
+
+    A token qualifies iff, across every stored row for that token_id:
+      - resolution == "" (never stamped)
+      - end_date is non-empty
+      - end_date's first 10 chars parse as %Y-%m-%d (unparseable -> skip,
+        not a candidate -- garbage data shouldn't wedge the updater)
+      - the parsed end_date (treated as midnight UTC) plus ``grace_hours``
+        is <= ``now`` (tz-aware UTC) -- avoids re-checking Gamma for a
+        market that hasn't even closed yet
+
+    Returns (slug, token_id, end_date) tuples, oldest end_date first,
+    truncated to ``cap``.
+    """
+    by_token: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        by_token.setdefault(row["token_id"], []).append(row)
+
+    candidates: List[Tuple[str, str, str]] = []
+    for token_id, trows in by_token.items():
+        qualifies = True
+        end_date = ""
+        for r in trows:
+            if r.get("resolution", ""):
+                qualifies = False
+                break
+            ed = r.get("end_date", "")
+            if not ed:
+                qualifies = False
+                break
+            try:
+                end_dt = datetime.strptime(ed[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                qualifies = False
+                break
+            if end_dt + timedelta(hours=grace_hours) > now:
+                qualifies = False
+                break
+            end_date = ed
+        if not qualifies:
+            continue
+        candidates.append((trows[0].get("slug", ""), token_id, end_date))
+
+    candidates.sort(key=lambda c: c[2])
+    return candidates[:cap]
+
+
+def _series_scan_start(
+    today: date,
+    lookback_days: int,
+    latest_end_date: Optional[date],
+    series_from: date,
+) -> date:
+    """Compute the recent-window scan start for a series' discovery pass.
+
+    ``update_calibration_data`` scans a RECENT window per cycle (unlike
+    ``fetch_and_store``'s full ``series_from_date`` scan) -- this is
+    self-healing after an engine outage: the window extends back to the
+    newest end_date already stored for that series, so a multi-day gap
+    still gets fully covered on the next run instead of silently skipping
+    the missed days.
+    """
+    lookback_start = today - timedelta(days=lookback_days)
+    if latest_end_date is not None:
+        return max(series_from, min(lookback_start, latest_end_date))
+    return max(series_from, lookback_start)
+
+
+def _latest_end_date_for_series(
+    store: "ContractPriceStore", series_filter: str
+) -> Optional[date]:
+    """Newest parsed end_date among stored rows whose slug matches
+    ``series_filter`` (input to ``_series_scan_start``'s self-healing
+    window). Returns None if no matching row has a parseable end_date.
+    """
+    latest: Optional[date] = None
+    for row in store._data:
+        if series_filter not in row.get("slug", ""):
+            continue
+        ed = row.get("end_date", "")
+        if not ed:
+            continue
+        try:
+            d = datetime.strptime(ed[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if latest is None or d > latest:
+            latest = d
+    return latest
+
+
+def update_calibration_data(
+    store: ContractPriceStore,
+    slugs: List[str],
+    slug_configs: Optional[Dict[str, Any]] = None,
+    lookback_days: int = 14,
+    max_refetch: int = 200,
+    max_workers: int = 4,
+    progress: Optional[ProgressFn] = None,
+) -> Dict[str, int]:
+    """Keep DATA/historical_prices.csv fresh for the Calibration dashboard tab.
+
+    Unlike ``fetch_and_store`` (full historical backfill, called from the
+    CLI / dashboard fetch button), this is meant to run on a short interval
+    from the engine's background poller: it only scans a RECENT window per
+    series for newly-discovered markets, fetches tokens not yet in the
+    store, and separately re-checks tokens that were fetched while still
+    open so their resolution eventually gets stamped once Gamma reports the
+    market closed.
+
+    Two-writer note: the engine poller and the dashboard's Backtest-tab
+    fetch button both write this same CSV via ``ContractPriceStore.save()``
+    (atomic replace, but no cross-process lock) -- last writer wins, so a
+    save from one process can drop rows the other just wrote, including a
+    freshly-stamped resolution. This self-heals: a lost resolution stamp
+    leaves the token all-empty-resolution again, so ``select_stale_
+    unresolved`` re-selects it on the next cycle. Considered acceptable
+    given the write cadence (hours, not seconds).
+
+    Steps:
+      1. For each series/btc_daily slug, discover new child markets in a
+         recent window (``_series_scan_start``) via ``discover_series_
+         markets``. Binary slugs pass through unchanged.
+      2. Fetch price history for any discovered/binary token not already in
+         the store, via a thread pool (mirrors ``fetch_and_store``); apply
+         each result on the main thread with ``_apply_fetch_result`` (same
+         no-lock, single-writer-thread model).
+      3. Re-check stale-unresolved tokens (``select_stale_unresolved``, cap
+         ``max_refetch``) against Gamma market metadata. If now resolved,
+         re-pull price history (fills any missed days) and apply -- this
+         stamps the resolution into the price CSV. If still open, skip; it
+         will be re-selected on a future cycle. Does NOT call
+         ``save_resolution``/resolutions.csv: that file has zero readers
+         today and appends unconditionally, so calling it here every cycle
+         would just accumulate duplicate rows with nothing consuming them.
+      4. ``store.save()`` at the end, plus a checkpoint save every
+         ``CHECKPOINT_EVERY`` successfully-applied results (interrupt
+         safety on a long run).
+
+    Returns a stats dict: discovered / new_fetched / resolutions_stamped /
+    failed (counts, not points).
+    """
+    report = progress or _default_progress
+    configs = slug_configs or {}
+    stats: Dict[str, int] = {
+        "discovered": 0, "new_fetched": 0, "resolutions_stamped": 0, "failed": 0,
+    }
+
+    today = datetime.now(timezone.utc).date()
+
+    # --- Step 1: recent-window series discovery (+ binary pass-through) ---
+    expanded: List[Tuple[str, Optional[str], str, str]] = []
+    for slug in slugs:
+        cfg = configs.get(slug)
+        kind = cfg.market_kind if cfg else "binary"
+
+        if kind == "btc_daily":
+            series_filter = "bitcoin-above"
+            series_from_str = "2024-01-01"
+        elif kind == "series":
+            series_filter = (cfg.series_filter if cfg and cfg.series_filter
+                             else _derive_series_filter(slug))
+            series_from_str = (cfg.series_from_date if cfg and cfg.series_from_date
+                               else "2024-01-01")
+        else:
+            expanded.append((slug, None, "", ""))
+            continue
+
+        series_from = parse_series_date(series_from_str)
+        latest_end_date = _latest_end_date_for_series(store, series_filter)
+        scan_start = _series_scan_start(today, lookback_days, latest_end_date, series_from)
+
+        report(
+            f"Calibration: scanning series '{slug}' from {scan_start} to {today} "
+            f"(filter='{series_filter}')..."
+        )
+        discovered = discover_series_markets(
+            base_slug=slug,
+            series_filter=series_filter,
+            from_date=scan_start,
+            to_date=today,
+            progress=report,
+        )
+        stats["discovered"] += len(discovered)
+        for m in discovered:
+            expanded.append((
+                m["slug"], m["token_id"],
+                m.get("end_date", ""), m.get("resolution", ""),
+            ))
+
+    # --- Step 2: fetch tokens not already in the store ---
+    existing_tokens = {r["token_id"] for r in store._data}
+    work: List[Tuple[str, Optional[str], str, str]] = []
+    for item in expanded:
+        known = item[1]
+        if known and known in existing_tokens:
+            continue
+        work.append(item)
+
+    report(f"Calibration: fetching {len(work)} new market(s) using {max_workers} workers...")
+    n_applied = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one_market, item): item for item in work}
+        for fut in as_completed(futures):
+            res = fut.result()
+            added = _apply_fetch_result(store, res)
+            if added < 0:
+                stats["failed"] += 1
+                continue
+            stats["new_fetched"] += 1
+            n_applied += 1
+            if n_applied % CHECKPOINT_EVERY == 0:
+                store.save()
+                report(f"  ...calibration checkpoint saved ({len(store._data)} rows)")
+
+    # --- Step 3: re-check stale-unresolved tokens against Gamma ---
+    now = datetime.now(timezone.utc)
+    stale = select_stale_unresolved(store._data, now, cap=max_refetch)
+    report(f"Calibration: {len(stale)} stale-unresolved token(s) to re-check...")
+    for slug, token_id, end_date in stale:
+        meta = fetch_market_metadata(slug)
+        time.sleep(CALL_DELAY_S)
+        if not meta:
+            continue  # transient API miss; re-selected next cycle
+        parsed = parse_market_outcomes(meta)
+        resolution = _resolution_from_outcome_prices(
+            parsed["outcomes"], meta.get("outcomePrices"), meta.get("closed"),
+        )
+        if not resolution:
+            continue  # not closed yet on Gamma; re-selected next cycle
+
+        history = fetch_price_history(token_id)
+        res = {
+            "slug": slug, "token_id": token_id, "history": history,
+            "end_date": end_date, "resolution": resolution,
+        }
+        added = _apply_fetch_result(store, res)
+        if added < 0:
+            stats["failed"] += 1
+            continue
+        stats["resolutions_stamped"] += 1
+        n_applied += 1
+        if n_applied % CHECKPOINT_EVERY == 0:
+            store.save()
+            report(f"  ...calibration checkpoint saved ({len(store._data)} rows)")
+
+    store.save()
+    report(
+        f"Calibration update complete: discovered={stats['discovered']} "
+        f"new_fetched={stats['new_fetched']} "
+        f"resolutions_stamped={stats['resolutions_stamped']} "
+        f"failed={stats['failed']}"
+    )
+    return stats

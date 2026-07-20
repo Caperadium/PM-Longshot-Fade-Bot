@@ -18,6 +18,9 @@ streamlit run fader/run_dashboard.py
 # Backtest dashboard (standalone)
 streamlit run fader/dashboard/backtest_page.py
 
+# Calibration page (standalone; also embedded as 9th dashboard tab)
+streamlit run fader/dashboard/calibration_page.py
+
 # Allocation analysis CLI
 python -c "import sys; sys.path.insert(0,'fader'); from backtest.allocation_analysis import main; main()"
 
@@ -69,6 +72,7 @@ Object construction is a composition root (`engine/build.py`'s `build_engine(cfg
 | State publisher | 2s | Write engine state to DB for dashboard |
 | Control consumer | 1s | Process dashboard commands (stop, close_all, etc.) |
 | Config watcher | 5s | Hot-reload config.yaml + slugs.csv on file change |
+| Calibration fetch | 6h (`polling.calibration_fetch_s`, 0 disables) | Incremental update of `DATA/historical_prices.csv` for the Calibration tab: recent-window series discovery + resolution stamping of stored-but-unresolved markets (`update_calibration_data`); runs once at startup, then per interval; covers ALL slugs.csv rows incl. disabled |
 
 ### 11-filter entry stack (fader/strategy/filters.py + engine/strategy_loop.py)
 1. NO best ask ∈ [band_low, band_high]
@@ -193,7 +197,7 @@ Current series:
 | `engine/risk.py` | Circuit breaker, max deployed, per-market caps. `breaker_tripped` is a property that reads through `BreakerRepo.day_state(today_utc())`, memoized <=1s — no in-memory trip flag, so a trip survives a `RiskManager` restart and a new UTC day simply has no DB row (no explicit rollover step) |
 | `engine/reconciler.py` | Startup + periodic API reconciliation (bankroll, orders, positions); skips the order-reconcile cycle when `fetch_open_orders()` returns `None` (API error) instead of mass-marking orders UNKNOWN. `bankroll` stays a plain `float` (five consumers depend on the exact type); `bankroll_view` is a separate `BankrollView(value, as_of)` property used only for staleness logging. Tracks consecutive reconcile failures on two separate counters: `reconcile_failures` (positions/paper-resolutions) and `order_reconcile_failures` (order-reconcile `None`-skip path); both published to `engine_state` and fire `infra.telegram.alert_reconcile_failures` (`>=` threshold of 5, refires every cycle at/above it) after 5 in a row, reset on the next success. The stale-UNKNOWN-to-CANCELLED order reaper (in `_reconcile_orders`) commits via `OrdersRepo.reap_stale_unknown()` with no shared conn — a pre-existing no-commit bug fixed in Phase 6 — and now compares a Python-computed ISO cutoff against `created_at` directly (was a raw-string comparison against SQLite's differently-formatted `datetime()` output, which made the effective TTL ~1 day instead of the intended 1 hour; fixed alongside the escalation-counter split above) |
 | `engine/control_consumer.py` | Dashboard-to-engine IPC via control_commands table |
-| `engine/pollers.py` | Bankroll (30s), resolution (60s), discovery (300s) background tasks; discovery mutates the shared `MarketRegistry` (`engine/registry.py`) instead of a bare dict |
+| `engine/pollers.py` | Bankroll (30s), resolution (60s), discovery (300s), calibration fetch (6h) background tasks; discovery mutates the shared `MarketRegistry` (`engine/registry.py`) instead of a bare dict; `_calibration_loop` runs `update_calibration_data` via `asyncio.to_thread`, telegram escalation after 5 consecutive failures |
 | `engine/state_publisher.py` | Engine → DB state publishing (2s interval) |
 | `infra/db.py` | SQLite WAL schema, all 10 tables + 11 indexes; low-level `get_connection`/`execute_write` primitives that `persistence/repos.py` builds on |
 | `infra/telegram.py` | Telegram alerts (heartbeat, breaker trips, errors) |
@@ -202,10 +206,12 @@ Current series:
 | `infra/logging_setup.py` | Structured logging configuration |
 | `persistence/repos.py` | Typed repository layer (`Db`, `PositionsRepo`, `OrdersRepo`, `BreakerRepo`, `DecisionsRepo`, `ControlRepo`, `EngineStateRepo`, `ConfigKVRepo`) — all engine-side SQL lives here. Module-level default instances (`positions_repo`, `orders_repo`, etc.) are used directly by engine code this phase; `Db.transaction()` gives atomic multi-statement writes (e.g. order-fill bookkeeping). Every method takes an optional `conn`: passed-in conn -> caller owns commit/close; `None` -> repo opens/commits/closes per call. |
 | `persistence/decision_log.py` | Per-decision log persistence to decisions table; delegates to `DecisionsRepo`. `log_decision`/`log_entered`/`log_rejected` return `bool` (success/failure of the write) |
-| `dashboard/app.py` | 8-tab Streamlit dashboard |
+| `dashboard/app.py` | 9-tab Streamlit dashboard |
 | `dashboard/backtest_page.py` | Backtest UI (embedded + standalone) with parameter sweep |
+| `dashboard/calibration_page.py` | Calibration tab (embedded + standalone): implied YES prob vs actual YES resolution rate from the historical price store; DTE-slider observation point, window/series filters, per-bucket table, monthly edge trend, bot-realized-calibration section (biased sample, labelled). Band/DTE defaults come from the engine's EFFECTIVE config (`load_config()` + `apply_config_kv_overrides`), so dashboard-written `config_kv` overrides are honored. Loads store via mtime-keyed `st.cache_data(ttl=300)` — invalidated by the engine's atomic CSV replace |
+| `backtest/calibration.py` | Pure, I/O-free calibration core: `CalibrationParams`, `wilson_interval`, `build_observations` (one obs per market at `end_date - dte_days`, nearest row within tolerance), `bucket_calibration`, `band_summary` (NO-side headline), `monthly_edge`, `bot_trade_calibration`, `filter_by_series`. Store price is the NO mid, so implied YES = 1 - price; positive edge = longshots overpriced = thesis holds |
 | `backtest/engine.py` | Backtest engine; filters 1-8 delegate to `strategy/filters.py` (Phase 4) with `missing_dte="skip"` (fail-open DTE) and volumes/depth/staleness always `None` (not reconstructable historically) — `run_backtest()` attaches the always-skipped filter names to `trades_df.attrs["skipped_filters"]`. Sizing delegates to `execution.sizing.compute_shares_and_notional` (Phase 5; local `_compute_size` deleted) — only the share-count element is used, `BacktestTrade.notional` stays the stake |
-| `backtest/historical.py` | Historical price fetching, ContractPriceStore, generic daily series discovery |
+| `backtest/historical.py` | Historical price fetching, ContractPriceStore (atomic `save()`: tmp + `os.replace`, retried on Windows reader locks), generic daily series discovery. `update_calibration_data` is the engine poller's incremental updater: recent-window series discovery (`_series_scan_start`, self-healing back to newest stored end_date after outages), fetch of new tokens, and `select_stale_unresolved` re-fetch that stamps resolutions onto markets first fetched while still open (skip-existing logic would otherwise never resolve them). Engine poller + dashboard fetch button are two writers, last-writer-wins; lost resolution stamps self-heal next cycle |
 | `backtest/metrics.py` | Sortino, Calmar, max DD, VaR/CVaR, block bootstrap CIs; `compute_all_metrics(..., skipped_filters=...)` builds `universe_discrepancies` from the actual skipped-filter set when provided, else the historical fixed 3-item list |
 | `backtest/walkforward.py` | Walk-forward stability (calendar window partitioning) |
 | `backtest/harness.py` | Shared backtest harness (Phase 5): `HarnessDefaults` dataclass (defaults CLIs override via `dataclasses.replace()` when they diverge, e.g. `crypto_sweep.CRYPTO_DEFAULTS`); `load_store()`; `run_config()` (`run_backtest` + `compute_all_metrics` + flat `MetricsRow` extraction); `run_grid()` (spawn-safe multiprocessing — module-level worker fn, `df_json` passed inside each worker's args, no pool initializer). Also holds all THREE walk-forward variants as separate functions — `walkforward_normalized` (= former `allocation_analysis.walkforward_validate`, globally-normalized sizing), `walkforward_lean` (= former `grid_sweep._oos_validate`, unnormalized sizing + per-band baseline cache), `window_stability` (= former `crypto_sweep._run_walkforward_for_top_configs`, same fixed config re-tested per window, no baseline comparison) — kept distinct because their sizing/comparison math differs; do not merge them |
@@ -218,7 +224,7 @@ Current series:
 
 ## Config
 
-Single YAML file at `fader/config/config.yaml`. Hot-reloaded by ConfigWatcher (5s poll of file mtime). Dashboard can also write live overrides to `config_kv` table. Slugs registry in `fader/config/slugs.csv`. Every hot-reload logs which YAML keys are currently shadowed by a `config_kv` row and publishes them to `engine_state` as `active_overrides`; the dashboard sidebar shows a caption listing any active overrides so a config.yaml edit that appears to have no effect is easy to diagnose.
+Single YAML file at `fader/config/config.yaml`. Hot-reloaded by ConfigWatcher (5s poll of file mtime). `polling.calibration_fetch_s` (default 21600) controls the calibration data poller; `0` disables it (rechecked every 300s, so hot-reload can re-enable without restart). Dashboard can also write live overrides to `config_kv` table. Slugs registry in `fader/config/slugs.csv`. Every hot-reload logs which YAML keys are currently shadowed by a `config_kv` row and publishes them to `engine_state` as `active_overrides`; the dashboard sidebar shows a caption listing any active overrides so a config.yaml edit that appears to have no effect is easy to diagnose.
 
 ### slugs.csv columns
 
