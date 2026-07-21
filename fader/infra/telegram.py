@@ -113,8 +113,13 @@ async def alert_ws_disconnect(reason: str) -> None:
     await send(f"<b>WS disconnected</b>: {reason}")
 
 
-async def alert_ws_reconnect() -> None:
-    await send("WS reconnected")
+async def alert_ws_reconnect(suppressed: int = 0) -> None:
+    """suppressed = reconnects since the last alert that were throttled
+    (WsClient fires at most one of these per RECONNECT_ALERT_MIN_INTERVAL_S)."""
+    if suppressed > 0:
+        await send(f"WS reconnected ({suppressed} earlier reconnects unreported)")
+    else:
+        await send("WS reconnected")
 
 
 async def alert_gap_halt(duration_s: float) -> None:

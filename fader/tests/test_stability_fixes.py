@@ -225,6 +225,247 @@ class TestWsForceReconnectWatchdog(unittest.IsolatedAsyncioTestCase):
                          "mark_alive must run before resync")
 
 
+class TestWatchdogPongLiveness(unittest.IsolatedAsyncioTestCase):
+    """Quiet-feed fix: a feed-silent socket that still answers PINGs is
+    alive, not half-open — the watchdog must NOT force-close it (the old
+    behavior produced a 110s reconnect loop on quiet nights). No PONG on
+    the current connection (or a stale one) keeps the original force-close."""
+
+    async def _run_watchdog_briefly(self, ws, interval=0.01, settle=0.05):
+        import marketdata.ws_client as ws_mod
+        with patch.object(ws_mod, "WATCHDOG_INTERVAL_S", interval):
+            task = asyncio.create_task(ws._watchdog_loop())
+            await asyncio.sleep(settle)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    def _make_silent_ws(self):
+        from marketdata.ws_client import WsClient
+
+        staleness = MagicMock()
+        staleness.feed_silence_s.return_value = 999.0
+        ws = WsClient(book_store=MagicMock(), staleness=staleness)
+        ws._connected = True
+        ws._ws = MagicMock()
+        ws._ws.close = AsyncMock()
+        ws.first_data_received = True
+        ws._force_reconnect_s = 10
+        return ws
+
+    async def test_fresh_pong_suppresses_force_close(self):
+        ws = self._make_silent_ws()
+        ws._pong_received_on_conn = True
+        ws._last_pong_ts = time.monotonic()
+
+        await self._run_watchdog_briefly(ws)
+
+        ws._ws.close.assert_not_awaited()
+        self.assertFalse(ws._force_close_issued)
+
+    async def test_stale_pong_still_force_closes(self):
+        ws = self._make_silent_ws()
+        ws._pong_received_on_conn = True
+        ws._last_pong_ts = time.monotonic() - 999.0
+
+        await self._run_watchdog_briefly(ws)
+
+        ws._ws.close.assert_awaited()
+
+    async def test_no_pong_on_conn_falls_back_to_force_close(self):
+        """A server that never PONGs must keep pre-fix behavior — the fresh
+        constructor _last_pong_ts alone cannot suppress the close."""
+        ws = self._make_silent_ws()
+        ws._pong_received_on_conn = False
+        ws._last_pong_ts = time.monotonic()
+
+        await self._run_watchdog_briefly(ws)
+
+        ws._ws.close.assert_awaited()
+
+    async def test_pong_frame_sets_liveness_flag(self):
+        from marketdata.ws_client import WsClient
+
+        ws = WsClient(book_store=MagicMock(), staleness=MagicMock())
+        ws._pong_received_on_conn = False
+        ws._last_pong_ts = 0.0
+
+        await ws._handle_message("PONG")
+
+        self.assertTrue(ws._pong_received_on_conn)
+        self.assertGreater(ws._last_pong_ts, 0.0)
+
+    async def test_reconnect_resets_pong_liveness_flag(self):
+        """Each new connection must re-prove liveness: _connect_and_run
+        clears the flag alongside the force-close spam guard."""
+        from marketdata.ws_client import WsClient
+
+        staleness = MagicMock()
+        ws = WsClient(book_store=MagicMock(), staleness=staleness)
+        ws._pong_received_on_conn = True
+
+        async def fake_resync(_tokens):
+            pass
+
+        ws._resync_books = fake_resync  # type: ignore[assignment]
+
+        class _FakeWs:
+            async def send(self, msg):
+                pass
+
+            async def close(self):
+                pass
+
+            def __aiter__(self):
+                async def _gen():
+                    return
+                    yield  # pragma: no cover
+                return _gen()
+
+        class _Conn:
+            async def __aenter__(self):
+                return _FakeWs()
+
+            async def __aexit__(self, *a):
+                return False
+
+        def _swallow_fire(coro=None, *a, **k):
+            if hasattr(coro, "close"):
+                coro.close()
+
+        import marketdata.ws_client as ws_mod
+        with patch.object(ws_mod.websockets, "connect", lambda *a, **k: _Conn()), \
+             patch("infra.telegram.fire", _swallow_fire):
+            await ws._connect_and_run()
+
+        self.assertFalse(ws._pong_received_on_conn)
+
+
+class TestReconnectAlertThrottle(unittest.IsolatedAsyncioTestCase):
+    """"WS reconnected" telegram alert: at most one per
+    RECONNECT_ALERT_MIN_INTERVAL_S; suppressed occurrences are counted and
+    folded into the next alert that fires."""
+
+    async def test_throttle_counts_and_reports_suppressed(self):
+        from marketdata.ws_client import WsClient
+
+        ws = WsClient(book_store=MagicMock(), staleness=MagicMock())
+        # new=MagicMock(): a bare patch of an async fn yields an AsyncMock
+        # whose un-awaited coroutine return triggers RuntimeWarnings.
+        with patch("infra.telegram.fire") as fire, \
+             patch("infra.telegram.alert_ws_reconnect", new=MagicMock()) as alert:
+            ws._maybe_alert_reconnect()  # first: fires immediately
+            ws._maybe_alert_reconnect()  # within window: suppressed
+            ws._maybe_alert_reconnect()  # within window: suppressed
+
+            self.assertEqual(fire.call_count, 1)
+            alert.assert_called_once_with(0)
+            self.assertEqual(ws._suppressed_reconnect_alerts, 2)
+
+            # Age the window: next call fires and reports the 2 suppressed.
+            ws._last_reconnect_alert_ts = time.monotonic() - 10_000
+            ws._maybe_alert_reconnect()
+
+            self.assertEqual(fire.call_count, 2)
+            alert.assert_called_with(2)
+            self.assertEqual(ws._suppressed_reconnect_alerts, 0)
+
+
+class TestResync404Unsubscribe(unittest.IsolatedAsyncioTestCase):
+    """A token whose /book 404s BOOK_404_UNSUB_AFTER consecutive resyncs is
+    gone (resolved/expired) and gets unsubscribed; a success resets the
+    count. Transient (non-404) failures never count toward unsubscribe."""
+
+    def _make_ws(self):
+        from marketdata.ws_client import WsClient
+
+        ws = WsClient(book_store=MagicMock(), staleness=MagicMock())
+        ws._ws = None  # not connected: unsubscribe skips the socket send
+        return ws
+
+    async def test_repeated_404_unsubscribes_token(self):
+        import marketdata.ws_client as ws_mod
+        from marketdata.rest_market import BookNotFound
+
+        ws = self._make_ws()
+        ws._subscribed = {"tok_dead", "tok_live"}
+
+        def side(t):
+            if t == "tok_dead":
+                raise BookNotFound(t)
+            return {"bids": [], "asks": []}
+
+        with patch.object(ws_mod, "fetch_order_book_snapshot", side_effect=side):
+            for _ in range(ws_mod.BOOK_404_UNSUB_AFTER - 1):
+                await ws._resync_books(["tok_dead", "tok_live"])
+                self.assertIn("tok_dead", ws._subscribed)
+            await ws._resync_books(["tok_dead", "tok_live"])
+
+        self.assertNotIn("tok_dead", ws._subscribed)
+        self.assertIn("tok_live", ws._subscribed)
+        self.assertNotIn("tok_dead", ws._book_404_counts)
+
+    async def test_success_resets_404_count(self):
+        import marketdata.ws_client as ws_mod
+
+        ws = self._make_ws()
+        ws._subscribed = {"tok"}
+        ws._book_404_counts["tok"] = ws_mod.BOOK_404_UNSUB_AFTER - 1
+
+        with patch.object(
+            ws_mod, "fetch_order_book_snapshot",
+            return_value={"bids": [], "asks": []},
+        ):
+            await ws._resync_books(["tok"])
+
+        self.assertNotIn("tok", ws._book_404_counts)
+        self.assertIn("tok", ws._subscribed)
+
+    async def test_transient_failure_does_not_count(self):
+        import marketdata.ws_client as ws_mod
+
+        ws = self._make_ws()
+        ws._subscribed = {"tok"}
+
+        with patch.object(
+            ws_mod, "fetch_order_book_snapshot",
+            side_effect=RuntimeError("timeout"),
+        ):
+            for _ in range(ws_mod.BOOK_404_UNSUB_AFTER + 1):
+                await ws._resync_books(["tok"])
+
+        self.assertIn("tok", ws._subscribed)
+        self.assertNotIn("tok", ws._book_404_counts)
+
+
+class TestBookSnapshot404(unittest.TestCase):
+    """fetch_order_book_snapshot: 404 raises BookNotFound with NO retries
+    (4xx is deterministic); other failures keep returning None."""
+
+    def test_404_raises_book_not_found_without_retry(self):
+        from requests import HTTPError
+        from marketdata import rest_market
+
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.raise_for_status.side_effect = HTTPError(response=resp)
+
+        with patch.object(rest_market.requests, "get", return_value=resp) as get:
+            with self.assertRaises(rest_market.BookNotFound):
+                rest_market.fetch_order_book_snapshot("tok123")
+            self.assertEqual(get.call_count, 1)
+
+    def test_non_http_failure_returns_none(self):
+        from marketdata import rest_market
+
+        with patch.object(
+            rest_market.requests, "get", side_effect=OSError("conn reset")
+        ), patch.object(rest_market.time, "sleep"):
+            self.assertIsNone(rest_market.fetch_order_book_snapshot("tok123"))
+
+
 class TestSetWatchdog(unittest.TestCase):
     """set_watchdog mirrors set_band: hot-reloadable, partial updates keep
     unspecified fields unchanged."""
