@@ -37,6 +37,13 @@ OUTCOME_NO = "no"
 ProgressFn = Callable[[str], None]
 
 
+class BookNotFound(Exception):
+    """CLOB /book returned 404 for a token — the market no longer exists
+    (resolved/expired). Raised so the ws resync path can distinguish a
+    permanently-gone token (candidate for unsubscribe) from a transient
+    fetch failure (returns None)."""
+
+
 def parse_market_outcomes(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Parse a Gamma market dict's ``clobTokenIds``/``outcomes`` fields.
 
@@ -94,6 +101,15 @@ def _get(url: str, params: Optional[Dict] = None, timeout: int = DEFAULT_TIMEOUT
                 continue
             resp.raise_for_status()
             return resp.json()
+        except requests.HTTPError as e:
+            # 4xx (other than 429, handled above) is deterministic — the
+            # resource is gone/invalid; retrying just burns rate limit.
+            status = e.response.status_code if e.response is not None else 0
+            if 400 <= status < 500:
+                raise
+            last_err = e
+            if retry < MAX_RETRIES - 1:
+                time.sleep(2 ** retry)
         except Exception as e:
             last_err = e
             if retry < MAX_RETRIES - 1:
@@ -102,13 +118,22 @@ def _get(url: str, params: Optional[Dict] = None, timeout: int = DEFAULT_TIMEOUT
 
 
 def fetch_order_book_snapshot(token_id: str) -> Optional[Dict[str, Any]]:
-    """REST /book snapshot for ws resync."""
+    """REST /book snapshot for ws resync.
+
+    Raises BookNotFound on a 404 (market gone); returns None on any other
+    failure (transient).
+    """
     try:
         data = _get(f"{CLOB_API_BASE}/book", params={"token_id": token_id})
         return {
             "bids": data.get("bids", []),
             "asks": data.get("asks", []),
         }
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            raise BookNotFound(token_id) from e
+        logger.warning(f"book snapshot for {token_id[:16]}: {e}")
+        return None
     except Exception as e:
         logger.warning(f"book snapshot for {token_id[:16]}: {e}")
         return None

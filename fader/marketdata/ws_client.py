@@ -35,7 +35,7 @@ except ImportError:
 from config.config_loader import DEFAULT_WS_URL
 from marketdata.book_state import BookStore
 from marketdata.staleness import StalenessTracker
-from marketdata.rest_market import fetch_order_book_snapshot
+from marketdata.rest_market import BookNotFound, fetch_order_book_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,16 @@ FORCE_RECONNECT_S = 90
 WATCHDOG_INTERVAL_S = 5
 RECONNECT_BASE_S = 1.0
 RECONNECT_MAX_S = 60.0
+# Watchdog PONG-liveness: a feed-silent socket is NOT force-closed while
+# PONGs keep arriving (quiet market != dead socket). Floor keeps the window
+# sane if ping_interval is hot-reloaded very low.
+PONG_FRESH_FLOOR_S = 30
+QUIET_FEED_LOG_INTERVAL_S = 600
+# Telegram "WS reconnected" throttle: at most one per this interval;
+# suppressed reconnects are counted and reported in the next alert.
+RECONNECT_ALERT_MIN_INTERVAL_S = 600
+# Consecutive resync 404s before a token is treated as gone and unsubscribed.
+BOOK_404_UNSUB_AFTER = 3
 
 
 class WsClient:
@@ -98,6 +108,19 @@ class WsClient:
         self._pong_timeout_s = PONG_TIMEOUT_S
         self._expect_pong = False
         self._last_pong_ts = time.monotonic()
+        # True once at least one PONG arrived on the CURRENT connection —
+        # gates the watchdog's PONG-liveness suppression so a server that
+        # never PONGs falls back to plain feed-silence behavior.
+        self._pong_received_on_conn = False
+        self._last_quiet_log_ts: Optional[float] = None
+
+        # Telegram reconnect-alert throttle state.
+        self._last_reconnect_alert_ts: Optional[float] = None
+        self._suppressed_reconnect_alerts = 0
+
+        # Consecutive /book-404 count per token (resync); at
+        # BOOK_404_UNSUB_AFTER the token is unsubscribed as gone.
+        self._book_404_counts: Dict[str, int] = {}
 
         # Event-type -> handler dispatch table (Phase 6, item 4). Built once
         # here since handlers are bound methods on this instance.
@@ -157,6 +180,7 @@ class WsClient:
     async def unsubscribe_tokens(self, token_ids: List[str]) -> None:
         for t in token_ids:
             self._subscribed.discard(t)
+            self._book_404_counts.pop(t, None)
         if self._ws and self._connected and token_ids:
             try:
                 msg = json.dumps({"assets_ids": token_ids, "operation": "unsubscribe"})
@@ -201,6 +225,7 @@ class WsClient:
             self._ws = ws
             self._connected = True
             self._force_close_issued = False  # clear spam guard on fresh connect
+            self._pong_received_on_conn = False  # re-prove liveness per connection
             # Reset the feed-silence baseline BEFORE resync so the watchdog
             # doesn't count outage time against the healthy new socket and
             # force-close it during a slow reconnect resync (the first_data_received
@@ -223,8 +248,7 @@ class WsClient:
             # Sticky thereafter — never reset across later reconnects.
             self.first_data_received = True
 
-            from infra import telegram
-            telegram.fire(telegram.alert_ws_reconnect())
+            self._maybe_alert_reconnect()
 
             # Start ping task
             ping_task = asyncio.create_task(self._ping_loop(ws))
@@ -234,6 +258,25 @@ class WsClient:
             finally:
                 ping_task.cancel()
                 self._connected = False
+
+    def _maybe_alert_reconnect(self) -> None:
+        """Fire the "WS reconnected" telegram alert, throttled to one per
+        RECONNECT_ALERT_MIN_INTERVAL_S. Suppressed occurrences are counted
+        and folded into the next alert that does fire, so churn (e.g. a
+        watchdog reconnect loop) can't spam the chat but is still visible."""
+        from infra import telegram
+
+        now = time.monotonic()
+        if (
+            self._last_reconnect_alert_ts is not None
+            and now - self._last_reconnect_alert_ts < RECONNECT_ALERT_MIN_INTERVAL_S
+        ):
+            self._suppressed_reconnect_alerts += 1
+            return
+        suppressed = self._suppressed_reconnect_alerts
+        self._suppressed_reconnect_alerts = 0
+        self._last_reconnect_alert_ts = now
+        telegram.fire(telegram.alert_ws_reconnect(suppressed))
 
     async def _ping_loop(self, ws) -> None:
         """Application-level keepalive (FIX 1a).
@@ -282,11 +325,23 @@ class WsClient:
                         None, lambda t=token_id: fetch_order_book_snapshot(t)
                     )
                     if snap:
+                        self._book_404_counts.pop(token_id, None)
                         self._books.snapshot(token_id, snap["bids"], snap["asks"])
                         self._staleness.touch(token_id)
                         book = self._books.get(token_id)
                         if book:
                             book.update_band_tracker(self._band_low, self._band_high)
+                except BookNotFound:
+                    n = self._book_404_counts.get(token_id, 0) + 1
+                    self._book_404_counts[token_id] = n
+                    if n >= BOOK_404_UNSUB_AFTER:
+                        logger.warning(
+                            f"book 404 x{n} for {token_id[:16]} — market gone, "
+                            f"unsubscribing"
+                        )
+                        await self.unsubscribe_tokens([token_id])
+                    else:
+                        logger.debug(f"book 404 ({n}) for {token_id[:16]}")
                 except Exception as e:
                     logger.warning(f"book resync for {token_id[:16]}: {e}")
 
@@ -310,15 +365,40 @@ class WsClient:
                 ):
                     silence = self._staleness.feed_silence_s()
                     if silence > self._force_reconnect_s:
-                        logger.warning(
-                            f"WS feed silent for {silence:.0f}s "
-                            f"(> {self._force_reconnect_s}s) — forcing reconnect"
+                        # A quiet feed on a live socket is not a half-open
+                        # socket: if the server is still answering our PINGs,
+                        # reconnecting produces no new data and just churns
+                        # (observed as a 110s reconnect loop on quiet nights).
+                        # Only suppress when a PONG has been seen on THIS
+                        # connection — a server that never PONGs keeps the
+                        # original feed-silence behavior.
+                        pong_age = time.monotonic() - self._last_pong_ts
+                        pong_fresh_s = max(
+                            2 * self._ping_interval_s, PONG_FRESH_FLOOR_S
                         )
-                        self._force_close_issued = True
-                        try:
-                            await self._ws.close()
-                        except Exception as e:
-                            logger.warning(f"watchdog force-close failed: {e}")
+                        if self._pong_received_on_conn and pong_age <= pong_fresh_s:
+                            now = time.monotonic()
+                            if (
+                                self._last_quiet_log_ts is None
+                                or now - self._last_quiet_log_ts
+                                >= QUIET_FEED_LOG_INTERVAL_S
+                            ):
+                                self._last_quiet_log_ts = now
+                                logger.info(
+                                    f"WS feed silent for {silence:.0f}s but PONGs "
+                                    f"fresh ({pong_age:.0f}s) — socket alive, not "
+                                    f"reconnecting"
+                                )
+                        else:
+                            logger.warning(
+                                f"WS feed silent for {silence:.0f}s "
+                                f"(> {self._force_reconnect_s}s) — forcing reconnect"
+                            )
+                            self._force_close_issued = True
+                            try:
+                                await self._ws.close()
+                            except Exception as e:
+                                logger.warning(f"watchdog force-close failed: {e}")
             except Exception as e:
                 logger.warning(f"watchdog loop error: {e}")
             await asyncio.sleep(WATCHDOG_INTERVAL_S)
@@ -402,6 +482,7 @@ class WsClient:
         # text rather than a JSON event.
         if isinstance(raw, str) and raw.strip() == "PONG":
             self._last_pong_ts = time.monotonic()
+            self._pong_received_on_conn = True
             return
 
         try:
