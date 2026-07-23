@@ -317,6 +317,28 @@ class StrategyLoop:
         """
         cfg = self._cfg
 
+        # -- Model pricer (optional, BTC-only, fail-open): evaluated HERE,
+        # right after pregate, not after the full 1-8 pass -- evaluate()
+        # registers the strike and warms the expiry's ladder cache, so it
+        # must run every tick for every in-band market. Evaluating only on
+        # a full filter pass would register a strike at the exact moment
+        # the contract enters (and filter 8 then blocks re-evaluation), so
+        # nearly every entry would be tagged naive forever. Log-only mode
+        # attaches model_p_yes / model_edge_no to the decision (entered or
+        # rejected); the veto itself is enforced AFTER filters 1-8 pass so
+        # a contract failing volume/staleness still logs its real reason.
+        # A None verdict (disabled, non-BTC, no cached ladder yet, stale
+        # BTC data, engine failure) never blocks entry. --
+        model_fields: Dict[str, Any] = {}
+        if self._model_pricer is not None:
+            try:
+                verdict = self._model_pricer.evaluate(slug, ask_f, dte_val)
+            except Exception as e:
+                logger.warning(f"Model pricer evaluate failed for {slug}: {e}")
+                verdict = None
+            if verdict is not None:
+                model_fields = dict(verdict)
+
         # -- Filters 4 & 5 REST inputs: volumes (cheap fields already
         # passed pregate; fetch the expensive ones only now) --
         vols = await self._get_volumes(slug)
@@ -334,29 +356,20 @@ class StrategyLoop:
         result = evaluate_entry(snapshot, params)
         if not result.passed:
             if log_decisions:
-                log_rejected(slug, token_id, result.reason, result.detail)
+                log_rejected(
+                    slug, token_id, result.reason,
+                    {**result.detail, **model_fields},
+                )
             return (0.0, 0.0)
 
-        # -- Model pricer (optional, BTC-only, fail-open): log-only mode
-        # attaches model_p_yes / model_edge_no to the entered decision;
-        # veto mode additionally rejects when the model NO edge is below
-        # pricer.min_edge. A None verdict (disabled, non-BTC, no cached
-        # ladder yet, stale BTC data, engine failure) never blocks entry. --
-        model_fields: Dict[str, Any] = {}
-        if self._model_pricer is not None:
-            try:
-                verdict = self._model_pricer.evaluate(slug, ask_f, dte_val)
-            except Exception as e:
-                logger.warning(f"Model pricer evaluate failed for {slug}: {e}")
-                verdict = None
-            if verdict is not None:
-                model_fields = dict(verdict)
-                if self._model_pricer.should_veto(verdict):
-                    if log_decisions:
-                        detail = dict(verdict)
-                        detail["min_edge"] = self._model_pricer.min_edge
-                        log_rejected(slug, token_id, "model_edge_low", detail)
-                    return (0.0, 0.0)
+        # -- Model veto (after filters 1-8 so reject reasons stay real) --
+        if self._model_pricer is not None and model_fields:
+            if self._model_pricer.should_veto(model_fields):
+                if log_decisions:
+                    detail = dict(model_fields)
+                    detail["min_edge"] = self._model_pricer.min_edge
+                    log_rejected(slug, token_id, "model_edge_low", detail)
+                return (0.0, 0.0)
 
         # -- Filters 9, 10, 11: risk --
         alpha = cfg.strategy.alpha

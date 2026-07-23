@@ -1,1 +1,3 @@
 # Changes
+
+- Fix model-pricer evaluation timing: evaluate right after pregate instead of after the full filters 1-8 pass. evaluate() registers the strike and warms the expiry ladder cache, so it must run every tick for every in-band market -- the old placement registered a strike only at the exact moment a contract entered (ladder still cold, entry tagged naive) and filter 8 then blocked re-evaluation, so live model-verdict collection would have stayed empty. Veto enforcement stays after filters 1-8 (reject reasons stay real); model fields now also attach to rejected decisions' detail JSON. File: fader/engine/strategy_loop.py (+ CLAUDE.md gate description).

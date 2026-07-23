@@ -123,14 +123,21 @@ markets get no WS deltas and go stale fast) and `check_time_in_band`
 two separate bypasses, both must be True for live's full gate.
 
 **Model-pricer gate** (`strategy/model_pricer.py`, optional, BTC-only,
-fail-open): after filters 1-8 pass, `_evaluate_and_enter` consults the
-injected `ModelPricer` (vendored V2 FIGARCH engine at repo-root
-`core/pricing/`, see PRICER_README.md). Log-only mode (default,
-`pricer.veto: false`) attaches `model_p_yes`/`model_edge_no`/`model_age_s`
-to the entered decision's filters JSON so live evidence accumulates
-without changing behavior; veto mode rejects with reason `model_edge_low`
-when `model_edge_no = (1 - model_p_yes) - no_ask` is below
-`pricer.min_edge`. A None verdict (pricer disabled, non-BTC slug, no
+fail-open): `_evaluate_and_enter` consults the injected `ModelPricer`
+(vendored V2 FIGARCH engine at repo-root `core/pricing/`, see
+PRICER_README.md) right after pregate -- NOT after the full 1-8 pass --
+because `evaluate()` registers the strike and warms the expiry's ladder
+cache, and that must happen every tick for every in-band market
+(evaluating only on a full pass would register a strike at the exact
+moment the contract enters, after which filter 8 blocks re-evaluation,
+tagging nearly every entry naive forever). The veto itself is enforced
+AFTER filters 1-8 pass, so a contract failing volume/staleness logs its
+real reason. Log-only mode (default, `pricer.veto: false`) attaches
+`model_p_yes`/`model_edge_no`/`model_age_s` to the decision's
+filters/detail JSON (entered AND rejected rows) so live evidence
+accumulates without changing behavior; veto mode rejects with reason
+`model_edge_low` when `model_edge_no = (1 - model_p_yes) - no_ask` is
+below `pricer.min_edge`. A None verdict (pricer disabled, non-BTC slug, no
 cached ladder yet, BTC data older than `pricer.data_max_age_s`, engine
 import/compute failure) NEVER blocks entry -- the model can only narrow
 the naive strategy. Ladder computes (GARCH/FIGARCH MLE + MC, seconds to
