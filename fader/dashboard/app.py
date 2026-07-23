@@ -86,6 +86,80 @@ def _get_config_kv(key: str, default: Any = None) -> Any:
     return config_kv_repo.get(key, default)
 
 
+def _model_pricer_cfg() -> tuple:
+    """Current (min_edge, veto_on) from the pricer config section.
+
+    Best-effort: the dashboard must render even if config load fails.
+    Used to label 'would-veto' rows -- note this is the CURRENT threshold,
+    not the value at decision time."""
+    try:
+        from config.config_loader import load_config
+        cfg = load_config()
+        return cfg.pricer.min_edge, cfg.pricer.veto
+    except Exception:
+        return 0.0, False
+
+
+def _model_verdict_for(decision: str, reason: str,
+                       model_edge_no: Optional[float],
+                       min_edge: float) -> str:
+    """Per-row model verdict:
+      VETOED     -- REJECTED with reason model_edge_low (veto mode fired)
+      would-veto -- model edge below current min_edge (log-only signal)
+      agree      -- model edge at/above current min_edge
+      naive      -- no model opinion recorded (pricer off/warming/non-BTC)"""
+    if decision == "REJECTED" and reason == "model_edge_low":
+        return "VETOED"
+    # None (row-level) OR NaN (pandas coerces a None-bearing float column
+    # to NaN) both mean "no model opinion recorded".
+    if model_edge_no is None or pd.isna(model_edge_no):
+        return "naive"
+    return "agree" if model_edge_no >= min_edge else "would-veto"
+
+
+def _attach_model_columns(df_dec: pd.DataFrame, min_edge: float) -> pd.DataFrame:
+    """Parse model-pricer fields out of filters_json into real columns
+    (model_p_yes, model_edge_no) and derive the per-row 'model' verdict."""
+    def _fields(raw):
+        try:
+            f = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            f = {}
+        return f.get("model_p_yes"), f.get("model_edge_no")
+
+    df = df_dec.copy()
+    parsed = [_fields(r) for r in df["filters_json"]]
+    df["model_p_yes"] = [p for p, _ in parsed]
+    df["model_edge_no"] = [e for _, e in parsed]
+    df["model"] = [
+        _model_verdict_for(d, r, e, min_edge)
+        for d, r, e in zip(df["decision"], df["reason"], df["model_edge_no"])
+    ]
+    return df
+
+
+def _model_edge_by_slug() -> Dict[str, Optional[float]]:
+    """{slug: model_edge_no} from each slug's most recent ENTERED decision
+    (daily binaries are one-position-per-market, so slug join is exact).
+    Missing/None = no model opinion at entry."""
+    df = _df_query(
+        """
+        SELECT slug, filters_json FROM decisions
+        WHERE decision='ENTERED' ORDER BY ts ASC
+        """
+    )
+    out: Dict[str, Optional[float]] = {}
+    if df.empty:
+        return out
+    for slug, raw in zip(df["slug"], df["filters_json"]):
+        try:
+            f = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            f = {}
+        out[slug] = f.get("model_edge_no")  # last (newest) wins
+    return out
+
+
 def _engine_is_running() -> bool:
     """Return True if engine published state within the last 15 seconds."""
     ts_str = _get_state("published_at")
@@ -522,12 +596,50 @@ with tab_orders:
 # ---- DECISIONS ----
 with tab_decisions:
     st.header("Decision Log")
-    filter_decision = st.selectbox("Filter", ["ALL", "ENTERED", "REJECTED"])
-    where_clause = (
-        f"WHERE decision='{filter_decision}'"
-        if filter_decision != "ALL"
-        else ""
+    pricer_min_edge, pricer_veto_on = _model_pricer_cfg()
+
+    # Model-pricer summary: actual vetoes (full table, cheap count) +
+    # verdict split over the last 2000 entered decisions (JSON parse).
+    n_vetoed = _scalar(
+        "SELECT COUNT(*) FROM decisions WHERE reason='model_edge_low'"
     )
+    df_ent = _df_query(
+        """
+        SELECT decision, reason, filters_json FROM decisions
+        WHERE decision='ENTERED' ORDER BY ts DESC LIMIT 2000
+        """
+    )
+    n_agree = n_would = n_naive = 0
+    if not df_ent.empty:
+        ent = _attach_model_columns(df_ent, pricer_min_edge)
+        counts = ent["model"].value_counts()
+        n_agree = int(counts.get("agree", 0))
+        n_would = int(counts.get("would-veto", 0))
+        n_naive = int(counts.get("naive", 0))
+
+    st.caption(
+        f"Model pricer: veto {'ON' if pricer_veto_on else 'OFF (log-only)'}, "
+        f"min_edge {pricer_min_edge:+.3f}. Entered-decision verdicts use the "
+        f"CURRENT min_edge, not the value at decision time."
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Entered: model agree", str(n_agree))
+    m2.metric("Entered: model would-veto", str(n_would))
+    m3.metric("Entered: naive (no opinion)", str(n_naive))
+    m4.metric("Rejected: MODEL VETOED", str(n_vetoed))
+
+    filter_decision = st.selectbox(
+        "Filter",
+        ["ALL", "ENTERED", "REJECTED", "MODEL VETOED", "MODEL WOULD-VETO"],
+    )
+    if filter_decision in ("ENTERED", "REJECTED"):
+        where_clause = f"WHERE decision='{filter_decision}'"
+    elif filter_decision == "MODEL VETOED":
+        where_clause = "WHERE reason='model_edge_low'"
+    elif filter_decision == "MODEL WOULD-VETO":
+        where_clause = "WHERE decision='ENTERED'"
+    else:
+        where_clause = ""
     df_dec = _df_query(
         f"""
         SELECT ts, slug, decision, reason, filters_json, order_id
@@ -538,7 +650,16 @@ with tab_decisions:
     if df_dec.empty:
         st.info("No decisions recorded yet")
     else:
-        st.dataframe(df_dec, width='stretch')
+        df_dec = _attach_model_columns(df_dec, pricer_min_edge)
+        if filter_decision == "MODEL WOULD-VETO":
+            df_dec = df_dec[df_dec["model"] == "would-veto"]
+        # model columns up front, raw filters_json last
+        cols = ["ts", "slug", "decision", "reason", "model",
+                "model_edge_no", "model_p_yes", "order_id", "filters_json"]
+        if df_dec.empty:
+            st.info("No decisions match this filter")
+        else:
+            st.dataframe(df_dec[cols], width='stretch')
 
 # ---- PNL & METRICS ----
 with tab_pnl:
@@ -575,6 +696,41 @@ with tab_pnl:
         by_slug.columns = ["slug", "total_pnl"]
         by_slug = by_slug.sort_values("total_pnl", ascending=False)
         st.dataframe(by_slug, width='stretch')
+
+        st.subheader("Model Pricer Split")
+        pnl_min_edge, pnl_veto_on = _model_pricer_cfg()
+        st.caption(
+            "Realized PnL of closed positions grouped by the model verdict "
+            "recorded on each entry decision. 'would-veto' uses the CURRENT "
+            f"pricer.min_edge ({pnl_min_edge:+.3f}). This is the "
+            "earns-its-keep readout: flip pricer.veto on only if 'agree' "
+            "beats 'would-veto' by enough to justify the trade-count cut."
+        )
+        edge_by_slug = _model_edge_by_slug()
+        dfm = df_all.copy()
+        dfm["model_edge_no"] = dfm["slug"].map(edge_by_slug)
+        dfm["model"] = [
+            _model_verdict_for("ENTERED", "", e, pnl_min_edge)
+            for e in dfm["model_edge_no"]
+        ]
+        split = (
+            dfm.groupby("model")
+            .agg(
+                trades=("realized_pnl", "size"),
+                total_pnl=("realized_pnl", "sum"),
+                avg_pnl=("realized_pnl", "mean"),
+                hit_rate=("realized_pnl", lambda s: (s > 0).mean()),
+                avg_model_edge=("model_edge_no", "mean"),
+            )
+            .reindex(["agree", "would-veto", "naive"])
+            .dropna(how="all")
+            .reset_index()
+        )
+        st.dataframe(
+            split.round({"total_pnl": 2, "avg_pnl": 4, "hit_rate": 3,
+                         "avg_model_edge": 4}),
+            width='stretch',
+        )
 
         st.subheader("Trade History")
         st.dataframe(

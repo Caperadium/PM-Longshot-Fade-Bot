@@ -11,3 +11,4 @@ python-telegram-bot>=21.0
 plotly>=5.18.0
 scipy>=1.11.0
 matplotlib>=3.8.0
+arch>=6.0.0  # GARCH/FIGARCH MLE for the vendored model pricer (core/pricing)

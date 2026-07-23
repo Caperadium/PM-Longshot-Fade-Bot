@@ -46,6 +46,7 @@ from engine.reconciler import Reconciler
 from engine.pollers import Pollers
 from engine.state_publisher import StatePublisher
 from persistence import repos as repos_module
+from strategy.model_pricer import ModelPricer
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class Engine:
     executor: ThreadPoolExecutor
     registry: MarketRegistry = field(default_factory=MarketRegistry)
     series_slugs: List[str] = field(default_factory=list)
+    model_pricer: Any = None
 
 
 def _make_on_market_resolved(registry: MarketRegistry) -> Callable:
@@ -149,12 +151,22 @@ def build_engine(cfg: AppConfig) -> Engine:
     registry = MarketRegistry()
 
     # ------------------------------------------------------------------
+    # model pricer (FIGARCH edge signal, strategy/model_pricer.py).
+    # Always constructed -- pricer.enabled is hot-reloadable and re-read
+    # on every evaluate(); construction imports nothing heavy (the
+    # pricing engine loads lazily in the worker thread). Ladder computes
+    # run on the shared REST executor.
+    # ------------------------------------------------------------------
+    model_pricer = ModelPricer(cfg.pricer, submit_fn=executor.submit)
+
+    # ------------------------------------------------------------------
     # strategy_loop (OrderManager injected via constructor -- no
     # set_order_manager late setter)
     # ------------------------------------------------------------------
     strategy_loop = StrategyLoop(
         cfg=cfg, book_store=book_store, staleness=staleness, risk=risk,
         order_manager=order_manager, registry=registry,
+        model_pricer=model_pricer,
     )
 
     # ------------------------------------------------------------------
@@ -219,4 +231,5 @@ def build_engine(cfg: AppConfig) -> Engine:
         staleness=staleness,
         executor=executor,
         registry=registry,
+        model_pricer=model_pricer,
     )

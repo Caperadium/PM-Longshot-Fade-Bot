@@ -118,6 +118,24 @@ class BankrollConfig:
 
 
 @dataclass
+class PricerConfig:
+    """FIGARCH model-pricer integration (strategy/model_pricer.py).
+
+    veto=False (default) = log-only: model probability/edge are attached to
+    entered decisions but never reject. veto=True rejects entries whose
+    model NO edge is below min_edge. All fields hot-reloadable."""
+    enabled: bool = True
+    veto: bool = False
+    min_edge: float = 0.0        # NO-side model edge threshold (veto mode)
+    reprice_s: int = 900         # per-expiry ladder cache TTL
+    n_sims: int = 15000          # Monte Carlo paths per ladder
+    garch_refit_s: int = 21600   # clear GARCH cache + reload jump params (6h)
+    data_max_age_s: int = 7200   # BTC intraday CSV older than this = no model opinion
+    data_refresh_s: int = 1800   # background BTC data fetch cadence; 0 = external timer owns it
+    data_dir: str = ""           # empty = <repo root>/DATA
+
+
+@dataclass
 class SlugRow:
     slug: str
     enabled: bool
@@ -144,6 +162,7 @@ class AppConfig:
     ratelimit: RateLimitConfig = field(default_factory=RateLimitConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     bankroll: BankrollConfig = field(default_factory=BankrollConfig)
+    pricer: PricerConfig = field(default_factory=PricerConfig)
     slugs: List[SlugRow] = field(default_factory=list)
 
     @property
@@ -240,6 +259,7 @@ def load_config(
         ("ratelimit", "ratelimit"),
         ("auth", "auth"),
         ("bankroll", "bankroll"),
+        ("pricer", "pricer"),
     ]:
         _apply_section(getattr(cfg, cls_attr), raw, section_name)
 
@@ -256,6 +276,11 @@ def _validate(cfg: AppConfig) -> None:
     assert -1.0 <= s.alpha <= 1.0, f"alpha must be in [-1, 1], got {s.alpha}"
     assert cfg.risk.daily_loss_breaker_pct > 0, "daily_loss_breaker_pct must be > 0"
     assert cfg.mode in ("paper", "live"), f"mode must be paper|live, got {cfg.mode!r}"
+    p = cfg.pricer
+    assert p.reprice_s > 0, "pricer.reprice_s must be > 0"
+    assert p.n_sims > 0, "pricer.n_sims must be > 0"
+    assert -1.0 <= p.min_edge <= 1.0, \
+        f"pricer.min_edge must be in [-1, 1], got {p.min_edge}"
 
 
 class ConfigWatcher:
@@ -347,6 +372,17 @@ class ConfigWatcher:
         c.risk.max_deployed_pct = n.risk.max_deployed_pct
         c.risk.per_market_cap_pct = n.risk.per_market_cap_pct
         c.risk.matic_min_balance = n.risk.matic_min_balance
+        # Pricer (all hot -- ModelPricer re-reads its live PricerConfig
+        # object on every call, so mutating fields in place is sufficient)
+        c.pricer.enabled = n.pricer.enabled
+        c.pricer.veto = n.pricer.veto
+        c.pricer.min_edge = n.pricer.min_edge
+        c.pricer.reprice_s = n.pricer.reprice_s
+        c.pricer.n_sims = n.pricer.n_sims
+        c.pricer.garch_refit_s = n.pricer.garch_refit_s
+        c.pricer.data_max_age_s = n.pricer.data_max_age_s
+        c.pricer.data_refresh_s = n.pricer.data_refresh_s
+        c.pricer.data_dir = n.pricer.data_dir
         # Slugs hot (triggers resubscribe via flag)
         c.slugs = n.slugs
 

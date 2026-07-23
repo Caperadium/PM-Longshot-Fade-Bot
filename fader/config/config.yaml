@@ -62,3 +62,18 @@ auth:
 bankroll:
   basis: cash  # all risk gating keys off on-chain USDC.e cash only
   paper_bankroll_usdc: 1000.0  # simulated USDC balance in paper mode
+
+# FIGARCH model pricer (vendored V2 engine, see PRICER_README.md).
+# veto=false (default) = log-only: model p_yes + NO edge are recorded on every
+# entered decision but never reject. Flip veto=true to require
+# model_edge_no >= min_edge (edge = (1 - model_p_yes) - no_ask).
+pricer:
+  enabled: true
+  veto: false
+  min_edge: 0.0
+  reprice_s: 900         # per-expiry ladder cache TTL (s)
+  n_sims: 15000          # Monte Carlo paths per ladder
+  garch_refit_s: 21600   # GARCH refit + jump-param reload cadence (6h)
+  data_max_age_s: 7200   # BTC intraday CSV older than this = no model opinion
+  data_refresh_s: 1800   # background BTC data fetch cadence; 0 = external timer owns it
+  data_dir: ""           # empty = <repo root>/DATA

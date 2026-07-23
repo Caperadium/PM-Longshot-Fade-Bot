@@ -63,6 +63,7 @@ class StrategyLoop:
         risk: RiskManager,
         order_manager=None,
         registry: Optional[MarketRegistry] = None,
+        model_pricer=None,
     ) -> None:
         self._cfg = cfg
         self._books = book_store
@@ -70,6 +71,7 @@ class StrategyLoop:
         self._risk = risk
         self._registry = registry if registry is not None else MarketRegistry()
         self._order_manager = order_manager
+        self._model_pricer = model_pricer  # strategy.model_pricer.ModelPricer or None
         self._bankroll: float = 0.0
         self._bankroll_fn = None  # optional live source (e.g. reconciler.bankroll)
         self._bankroll_view_fn = None  # optional BankrollView source (age logging)
@@ -335,6 +337,27 @@ class StrategyLoop:
                 log_rejected(slug, token_id, result.reason, result.detail)
             return (0.0, 0.0)
 
+        # -- Model pricer (optional, BTC-only, fail-open): log-only mode
+        # attaches model_p_yes / model_edge_no to the entered decision;
+        # veto mode additionally rejects when the model NO edge is below
+        # pricer.min_edge. A None verdict (disabled, non-BTC, no cached
+        # ladder yet, stale BTC data, engine failure) never blocks entry. --
+        model_fields: Dict[str, Any] = {}
+        if self._model_pricer is not None:
+            try:
+                verdict = self._model_pricer.evaluate(slug, ask_f, dte_val)
+            except Exception as e:
+                logger.warning(f"Model pricer evaluate failed for {slug}: {e}")
+                verdict = None
+            if verdict is not None:
+                model_fields = dict(verdict)
+                if self._model_pricer.should_veto(verdict):
+                    if log_decisions:
+                        detail = dict(verdict)
+                        detail["min_edge"] = self._model_pricer.min_edge
+                        log_rejected(slug, token_id, "model_edge_low", detail)
+                    return (0.0, 0.0)
+
         # -- Filters 9, 10, 11: risk --
         alpha = cfg.strategy.alpha
         if alpha != 0.0:
@@ -365,7 +388,7 @@ class StrategyLoop:
             token_id=token_id,
             book=book,
             notional=notional,
-            filters={"band_low": band_low, "band_high": band_high},
+            filters={"band_low": band_low, "band_high": band_high, **model_fields},
             market_info=market_info,
         )
         return (notional, notional)

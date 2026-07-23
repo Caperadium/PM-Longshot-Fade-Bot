@@ -36,3 +36,7 @@ Thumbs.db
 
 # Temporary artifacts (reviews, plans, scratch) — per CLAUDE.md
 temp/
+
+# Vendored proprietary V2 pricing engine -- NEVER commit (public repo); deployed to VPS via scp
+core/
+PRICER_README.md

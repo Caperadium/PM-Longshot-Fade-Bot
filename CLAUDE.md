@@ -122,6 +122,22 @@ markets get no WS deltas and go stale fast) and `check_time_in_band`
 (those same markets rarely accrue enough continuous in-band WS time) --
 two separate bypasses, both must be True for live's full gate.
 
+**Model-pricer gate** (`strategy/model_pricer.py`, optional, BTC-only,
+fail-open): after filters 1-8 pass, `_evaluate_and_enter` consults the
+injected `ModelPricer` (vendored V2 FIGARCH engine at repo-root
+`core/pricing/`, see PRICER_README.md). Log-only mode (default,
+`pricer.veto: false`) attaches `model_p_yes`/`model_edge_no`/`model_age_s`
+to the entered decision's filters JSON so live evidence accumulates
+without changing behavior; veto mode rejects with reason `model_edge_low`
+when `model_edge_no = (1 - model_p_yes) - no_ask` is below
+`pricer.min_edge`. A None verdict (pricer disabled, non-BTC slug, no
+cached ladder yet, BTC data older than `pricer.data_max_age_s`, engine
+import/compute failure) NEVER blocks entry -- the model can only narrow
+the naive strategy. Ladder computes (GARCH/FIGARCH MLE + MC, seconds to
+tens of seconds) run on the shared executor, one ladder per expiry per
+`pricer.reprice_s`, single-flight with 60s retry backoff; `evaluate()` is
+synchronous dict lookups, safe at the 1s tick.
+
 **Backtest mapping** (`backtest/engine.py`): builds an `EntrySnapshot` per
 row with `volume_24h`/`volume_total`/`ask_depth_usd`/`is_stale` always
 `None` (not reconstructable from historical Polymarket data) and
@@ -182,6 +198,7 @@ Current series:
 |---|---|
 | `config/config_loader.py` | AppConfig, load_config, config hot-reload (5s mtime poll). `DEFAULT_WS_URL` is the single authoritative default for the CLOB market-data websocket URL (`FeedConfig.ws_url` and `marketdata/ws_client.py`'s constructor default both reference it). `apply_config_kv_overrides(cfg)` returns the list of YAML keys currently shadowed by a `config_kv` row; `ConfigWatcher.check_and_reload` logs that list and publishes it to `engine_state` as `active_overrides` (rendered in the dashboard sidebar) |
 | `strategy/filters.py` | Pure, I/O-free shared filter core (Phase 4): `FilterParams`, `EntrySnapshot`, `FilterResult`, `evaluate_pregate` (filters 1-2), `evaluate_entry` (filters 1-8). Used by both `engine/strategy_loop.py` (live) and `backtest/engine.py` (backtest) — one implementation instead of two |
+| `strategy/model_pricer.py` | `ModelPricer`: FIGARCH model-edge signal over the vendored V2 pricing engine (repo-root `core/pricing/`). Per-expiry ladder cache, background compute on the shared executor (single-flight, retry backoff), BTC-data staleness gate, optional BTC data self-refresh (subprocess `core/data/data_fetcher.py`; `pricer.data_refresh_s: 0` when an external timer owns it), calibrated jump-param loading (lam->lambda key mapping), GARCH refit cadence. `parse_btc_market(slug)` parses strike + expiry key from `bitcoin-above-*` slugs (numeric + k-suffixed). Log-only vs veto per `pricer` config; fail-open by design. Built in `engine/build.py`, injected into `StrategyLoop` |
 | `execution/provider.py` | `BaseProvider`/`LiveProvider`/`PaperProvider` split, `OrderResult` dataclass, `MarketInfo`, CLOB client, `make_provider(cfg,...)` factory, `Provider(...)` compatibility alias, `is_paper` property |
 | `execution/order_manager.py` | Order placement, market/limit dispatch on `OrderResult.status`, `_handle_duplicate` recovery, requote loop, TTL |
 | `execution/sizing.py` | Alpha tilt notional sizing, band redistribution, $1.00 floor |
@@ -206,7 +223,7 @@ Current series:
 | `infra/logging_setup.py` | Structured logging configuration |
 | `persistence/repos.py` | Typed repository layer (`Db`, `PositionsRepo`, `OrdersRepo`, `BreakerRepo`, `DecisionsRepo`, `ControlRepo`, `EngineStateRepo`, `ConfigKVRepo`) — all engine-side SQL lives here. Module-level default instances (`positions_repo`, `orders_repo`, etc.) are used directly by engine code this phase; `Db.transaction()` gives atomic multi-statement writes (e.g. order-fill bookkeeping). Every method takes an optional `conn`: passed-in conn -> caller owns commit/close; `None` -> repo opens/commits/closes per call. |
 | `persistence/decision_log.py` | Per-decision log persistence to decisions table; delegates to `DecisionsRepo`. `log_decision`/`log_entered`/`log_rejected` return `bool` (success/failure of the write) |
-| `dashboard/app.py` | 9-tab Streamlit dashboard |
+| `dashboard/app.py` | 9-tab Streamlit dashboard. Decisions tab surfaces the model-pricer verdict per row (`VETOED`/`agree`/`would-veto`/`naive`, parsed from `filters_json`; `MODEL VETOED`/`MODEL WOULD-VETO` filters + summary counts); PnL tab's "Model Pricer Split" groups closed positions' realized PnL by the entry decision's model verdict (the readout for deciding when to flip `pricer.veto` on). `would-veto` labels use the CURRENT `pricer.min_edge`, not the value at decision time |
 | `dashboard/backtest_page.py` | Backtest UI (embedded + standalone) with parameter sweep |
 | `dashboard/calibration_page.py` | Calibration tab (embedded + standalone): implied YES prob vs actual YES resolution rate from the historical price store; DTE-slider observation point, window/series filters, per-bucket table, monthly edge trend, bot-realized-calibration section (biased sample, labelled). Band/DTE defaults come from the engine's EFFECTIVE config (`load_config()` + `apply_config_kv_overrides`), so dashboard-written `config_kv` overrides are honored. Loads store via mtime-keyed `st.cache_data(ttl=300)` — invalidated by the engine's atomic CSV replace |
 | `backtest/calibration.py` | Pure, I/O-free calibration core: `CalibrationParams`, `wilson_interval`, `build_observations` (one obs per market at `end_date - dte_days`, nearest row within tolerance), `bucket_calibration`, `band_summary` (NO-side headline), `monthly_edge`, `bot_trade_calibration`, `filter_by_series`. Store price is the NO mid, so implied YES = 1 - price; positive edge = longshots overpriced = thesis holds |
@@ -224,7 +241,7 @@ Current series:
 
 ## Config
 
-Single YAML file at `fader/config/config.yaml`. Hot-reloaded by ConfigWatcher (5s poll of file mtime). `polling.calibration_fetch_s` (default 21600) controls the calibration data poller; `0` disables it (rechecked every 300s, so hot-reload can re-enable without restart). Dashboard can also write live overrides to `config_kv` table. Slugs registry in `fader/config/slugs.csv`. Every hot-reload logs which YAML keys are currently shadowed by a `config_kv` row and publishes them to `engine_state` as `active_overrides`; the dashboard sidebar shows a caption listing any active overrides so a config.yaml edit that appears to have no effect is easy to diagnose.
+Single YAML file at `fader/config/config.yaml`. Hot-reloaded by ConfigWatcher (5s poll of file mtime). The `pricer` section (model-pricer gate) is fully hot-reloadable -- `ModelPricer` holds the live `PricerConfig` object and re-reads it per call, so flipping `pricer.veto` or `pricer.min_edge` needs no restart. `polling.calibration_fetch_s` (default 21600) controls the calibration data poller; `0` disables it (rechecked every 300s, so hot-reload can re-enable without restart). Dashboard can also write live overrides to `config_kv` table. Slugs registry in `fader/config/slugs.csv`. Every hot-reload logs which YAML keys are currently shadowed by a `config_kv` row and publishes them to `engine_state` as `active_overrides`; the dashboard sidebar shows a caption listing any active overrides so a config.yaml edit that appears to have no effect is easy to diagnose.
 
 ### slugs.csv columns
 
